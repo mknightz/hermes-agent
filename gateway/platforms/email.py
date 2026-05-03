@@ -358,11 +358,27 @@ class EmailAdapter(BasePlatformAdapter):
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    status, msg_data = imap.uid("fetch", uid, "(BODY[])")
                     if status != "OK":
                         continue
 
-                    raw_email = msg_data[0][1]
+                    # IMAP fetch responses can interleave (envelope, body)
+                    # tuples with bare bytes status fragments. iCloud does
+                    # this unpredictably — find the first tuple with a bytes
+                    # payload to get the actual message body.
+                    raw_email = None
+                    for item in msg_data:
+                        if (isinstance(item, tuple) and len(item) >= 2
+                                and isinstance(item[1], (bytes, bytearray))):
+                            raw_email = item[1]
+                            break
+                    if raw_email is None:
+                        logger.warning(
+                            "[Email] No body in fetch response for UID %s; skipping",
+                            uid.decode() if isinstance(uid, bytes) else uid,
+                        )
+                        continue
+
                     msg = email_lib.message_from_bytes(raw_email)
 
                     sender_raw = msg.get("From", "")
