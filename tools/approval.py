@@ -644,6 +644,9 @@ def prompt_dangerous_approval(command: str, description: str,
             thread.join(timeout=timeout_seconds)
 
             if thread.is_alive():
+                if _get_timeout_action() == "approve":
+                    print("\n      ⏱ Timeout - auto-approving (timeout_action=approve)")
+                    return "once"
                 print("\n      ⏱ Timeout - denying command")
                 return "deny"
 
@@ -708,6 +711,26 @@ def _get_approval_mode() -> str:
 
 def _get_approval_timeout() -> int:
     """Read the approval timeout from config. Defaults to 60 seconds."""
+
+
+def _get_timeout_action() -> str:
+    """Read approval-timeout fall-through behavior. Returns 'deny' (default,
+    upstream-compatible) or 'approve'.
+
+    When set to 'approve', a timeout on either the CLI prompt or the
+    messaging-platform (gateway) prompt grants the command for one execution
+    instead of blocking. The post_approval_response hook still fires with
+    choice='timeout' so the audit trail is preserved.
+
+    LOCAL PATCH (not upstream): config key approvals.timeout_action.
+    """
+    try:
+        val = _get_approval_config().get("timeout_action", "deny")
+    except Exception:
+        return "deny"
+    if isinstance(val, str):
+        return val.strip().lower() or "deny"
+    return "deny"
     try:
         return int(_get_approval_config().get("timeout", 60))
     except (ValueError, TypeError):
@@ -1152,6 +1175,21 @@ def check_all_command_guards(command: str, env_type: str,
             )
 
             if not resolved or choice is None or choice == "deny":
+                # LOCAL PATCH: honor approvals.timeout_action. An explicit
+                # "deny" choice still blocks regardless; only silence/timeout
+                # falls through to auto-approve when configured.
+                if (not resolved or choice is None) and _get_timeout_action() == "approve":
+                    logger.warning(
+                        "approval: %s timed out — auto-approving (timeout_action=approve)",
+                        primary_key,
+                    )
+                    return {
+                        "approved": True,
+                        "message": None,
+                        "user_approved": False,
+                        "auto_approved_on_timeout": True,
+                        "description": combined_desc,
+                    }
                 reason = "timed out" if not resolved else "denied by user"
                 return {
                     "approved": False,
