@@ -381,6 +381,30 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
 }
 
 
+# opencode.ai/zen — published per-million-token rates from
+# https://opencode.ai/docs/zen.  Snapshot 2026-05-04.  opencode-zen's
+# /models endpoint does not return pricing fields, so we pin them here
+# and refresh on docs changes.
+_OPENCODE_ZEN_PRICING: Dict[str, PricingEntry] = {
+    "kimi-k2.6": PricingEntry(
+        input_cost_per_million=Decimal("0.95"),
+        output_cost_per_million=Decimal("4.00"),
+        cache_read_cost_per_million=Decimal("0.16"),
+        source="official_docs_snapshot",
+        source_url="https://opencode.ai/docs/zen",
+        pricing_version="opencode-zen-pricing-2026-05-04",
+    ),
+    "kimi-k2.5": PricingEntry(
+        input_cost_per_million=Decimal("0.60"),
+        output_cost_per_million=Decimal("3.00"),
+        cache_read_cost_per_million=Decimal("0.10"),
+        source="official_docs_snapshot",
+        source_url="https://opencode.ai/docs/zen",
+        pricing_version="opencode-zen-pricing-2026-05-04",
+    ),
+}
+
+
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
         return None
@@ -415,6 +439,8 @@ def resolve_billing_route(
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
+    if provider_name in {"opencode-go", "opencode-zen"} or base_url_host_matches(base_url or "", "opencode.ai"):
+        return BillingRoute(provider="opencode-zen", model=model.split("/")[-1], base_url=base_url or "", billing_mode="opencode_zen_docs_snapshot")
     if provider_name == "anthropic":
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
@@ -501,6 +527,8 @@ def get_pricing_entry(
         )
     if route.provider == "openrouter":
         return _openrouter_pricing_entry(route)
+    if route.billing_mode == "opencode_zen_docs_snapshot":
+        return _OPENCODE_ZEN_PRICING.get(route.model.lower())
     if route.base_url:
         entry = _pricing_entry_from_metadata(
             fetch_endpoint_model_metadata(route.base_url, api_key=api_key or ""),

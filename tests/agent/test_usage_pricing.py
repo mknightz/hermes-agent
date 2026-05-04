@@ -5,6 +5,7 @@ from agent.usage_pricing import (
     estimate_usage_cost,
     get_pricing_entry,
     normalize_usage,
+    resolve_billing_route,
 )
 
 
@@ -190,3 +191,38 @@ def test_custom_endpoint_models_api_pricing_is_supported(monkeypatch):
 
     assert float(entry.input_cost_per_million) == 0.5
     assert float(entry.output_cost_per_million) == 2.0
+
+
+def test_opencode_zen_route_normalizes_provider_aliases():
+    # opencode-go (auth flow) and opencode-zen (billing entity) and host
+    # detection all collapse to the same canonical billing route.
+    for kwargs in (
+        {"provider": "opencode-go", "base_url": "https://opencode.ai/zen/go/v1"},
+        {"provider": "opencode-zen"},
+        {"base_url": "https://opencode.ai/zen/go/v1"},
+    ):
+        route = resolve_billing_route("kimi-k2.6", **kwargs)
+        assert route.provider == "opencode-zen"
+        assert route.model == "kimi-k2.6"
+        assert route.billing_mode == "opencode_zen_docs_snapshot"
+
+
+def test_opencode_zen_pricing_uses_pinned_docs_snapshot():
+    entry = get_pricing_entry(
+        "kimi-k2.6",
+        provider="opencode-go",
+        base_url="https://opencode.ai/zen/go/v1",
+    )
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.95
+    assert float(entry.output_cost_per_million) == 4.00
+    assert float(entry.cache_read_cost_per_million) == 0.16
+    assert entry.source == "official_docs_snapshot"
+    assert entry.source_url == "https://opencode.ai/docs/zen"
+
+
+def test_opencode_zen_pricing_returns_none_for_unknown_model():
+    # Dict miss should fail loud (None) rather than fall through to
+    # /models endpoint heuristics — that path returns wrong/empty data
+    # for opencode-zen and would mask real pricing-table drift.
+    assert get_pricing_entry("not-a-real-model", provider="opencode-go") is None
