@@ -227,6 +227,9 @@ class EmailAdapter(BasePlatformAdapter):
 
         self._address = os.getenv("EMAIL_ADDRESS", "")
         self._password = os.getenv("EMAIL_PASSWORD", "")
+        # Optional display From: address (e.g. an iCloud+ Custom Domain alias).
+        # Falls back to EMAIL_ADDRESS so default behavior is unchanged.
+        self._from_address = os.getenv("EMAIL_FROM_ADDRESS") or self._address
         self._imap_host = os.getenv("EMAIL_IMAP_HOST", "")
         self._imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
         self._smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
@@ -358,11 +361,27 @@ class EmailAdapter(BasePlatformAdapter):
                     if len(self._seen_uids) > self._seen_uids_max:
                         self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    status, msg_data = imap.uid("fetch", uid, "(BODY[])")
                     if status != "OK":
                         continue
 
-                    raw_email = msg_data[0][1]
+                    # IMAP fetch responses can interleave (envelope, body)
+                    # tuples with bare bytes status fragments. iCloud does
+                    # this unpredictably — find the first tuple with a bytes
+                    # payload to get the actual message body.
+                    raw_email = None
+                    for item in msg_data:
+                        if (isinstance(item, tuple) and len(item) >= 2
+                                and isinstance(item[1], (bytes, bytearray))):
+                            raw_email = item[1]
+                            break
+                    if raw_email is None:
+                        logger.warning(
+                            "[Email] No body in fetch response for UID %s; skipping",
+                            uid.decode() if isinstance(uid, bytes) else uid,
+                        )
+                        continue
+
                     msg = email_lib.message_from_bytes(raw_email)
 
                     sender_raw = msg.get("From", "")
@@ -489,7 +508,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         # Thread context for reply
@@ -600,7 +619,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
@@ -681,7 +700,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = self._from_address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
