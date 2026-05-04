@@ -235,3 +235,48 @@ class TestUsageAndCostTotalKey:
         assert cost_details["input"] > 0
         assert cost_details["output"] > 0
         assert cost_details["cache_read_input_tokens"] > 0
+
+    def test_post_api_request_dict_path_sets_total_key(self):
+        """The post_api_request hook passes usage as a dict, not a response.
+
+        Both cost paths in on_post_llm_call must set cost_details['total'] —
+        patching only the response-object path leaves real Hermes traces with
+        calculatedTotalCost=0 because production primarily uses the dict path.
+        """
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        captured = {}
+
+        def stub_end(observation, *, output=None, metadata=None,
+                     usage_details=None, cost_details=None):
+            captured["cost_details"] = cost_details
+
+        fake_gen = object()
+        fake_state = mod.TraceState(
+            trace_id="t", root_ctx=None, root_span=None,
+            generations={mod._request_key(1): fake_gen},
+        )
+        mod._TRACE_STATE[mod._trace_key("t", "s")] = fake_state
+        mod._end_observation = stub_end
+        mod._get_langfuse = lambda: object()
+        mod._finish_trace = lambda *a, **k: None
+
+        mod.on_post_llm_call(
+            task_id="t", session_id="s", api_call_count=1,
+            provider="opencode-go", api_mode="chat_completions",
+            model="kimi-k2.6", base_url="https://opencode.ai/zen/go/v1",
+            usage={
+                "input_tokens": 7505,
+                "output_tokens": 47,
+                "cache_read_tokens": 12288,
+            },
+            assistant_content_chars=10,
+            assistant_tool_call_count=0,
+        )
+        cost_details = captured.get("cost_details") or {}
+        assert "total" in cost_details, "dict-path must set cost_details['total']"
+        assert cost_details["total"] > 0
+        assert cost_details.get("input", 0) > 0
+        assert cost_details.get("output", 0) > 0
+        assert cost_details.get("cache_read_input_tokens", 0) > 0

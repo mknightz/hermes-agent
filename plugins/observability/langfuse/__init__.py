@@ -803,10 +803,14 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                     cost_details["cache_read_input_tokens"] = float(Decimal(_cache_read) * entry.cache_read_cost_per_million / _ONE_M)
                 if entry.cache_write_cost_per_million is not None and _cache_write:
                     cost_details["cache_creation_input_tokens"] = float(Decimal(_cache_write) * entry.cache_write_cost_per_million / _ONE_M)
-            else:
-                _cost = estimate_usage_cost(model, _cu, provider=provider, base_url=base_url, api_key="")
-                if _cost.amount_usd is not None:
-                    cost_details["total"] = float(_cost.amount_usd)
+            # Always populate "total" — Langfuse derives the dashboard
+            # rollup (calculatedTotalCost, daily metrics totalCost) from this
+            # key, NOT from summing the per-type sub-buckets.  Without it,
+            # any costDetails containing custom keys (e.g. cache_read_*)
+            # leaves calculatedTotalCost stuck at 0.
+            _cost = estimate_usage_cost(model, _cu, provider=provider, base_url=base_url, api_key="")
+            if _cost.amount_usd is not None:
+                cost_details["total"] = float(_cost.amount_usd)
         except Exception:
             pass
     else:
