@@ -196,3 +196,42 @@ class TestProviderQualifiedModel:
         q = self._q()
         assert q("", "kimi-k2.6") == "kimi-k2.6"
         assert q("opencode-go", "") == ""
+
+
+class TestUsageAndCostTotalKey:
+    """Langfuse v3 reads dashboard rollup from cost_details['total'].
+
+    Without a 'total' key, calculatedTotalCost stays 0 even when sub-buckets
+    (input/output/cache_*) are populated.  Regression guard for the bug where
+    the happy path (entry found) wrote per-type cost_details but never set
+    total, leaving daily metrics totalCost at 0 for the entire project.
+    """
+
+    def test_happy_path_sets_total_key(self):
+        from types import SimpleNamespace
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        # OpenAI/opencode-zen shape: prompt_tokens INCLUDES cached tokens;
+        # normalize_usage subtracts cached to derive the input bucket.  So
+        # prompt_tokens=19793 (7505 fresh + 12288 cached).
+        usage = SimpleNamespace(
+            prompt_tokens=19793,
+            completion_tokens=47,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=12288),
+        )
+        response = SimpleNamespace(usage=usage)
+        _, cost_details = mod._usage_and_cost(
+            response,
+            provider="opencode-go",
+            api_mode="chat_completions",
+            model="kimi-k2.6",
+            base_url="https://opencode.ai/zen/go/v1",
+        )
+
+        assert "total" in cost_details, "happy path must set cost_details['total'] for Langfuse rollup"
+        assert cost_details["total"] > 0
+        # Per-bucket sub-totals are still emitted alongside total.
+        assert cost_details["input"] > 0
+        assert cost_details["output"] > 0
+        assert cost_details["cache_read_input_tokens"] > 0

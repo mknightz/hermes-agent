@@ -454,8 +454,10 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
                         cost_details["cache_read_input_tokens"] = float(Decimal(canonical.cache_read_tokens) * entry.cache_read_cost_per_million / _ONE_M)
                     if entry.cache_write_cost_per_million is not None and canonical.cache_write_tokens:
                         cost_details["cache_creation_input_tokens"] = float(Decimal(canonical.cache_write_tokens) * entry.cache_write_cost_per_million / _ONE_M)
-                else:
-                    cost_details["total"] = float(cost.amount_usd)
+                # Always populate "total" — Langfuse derives the dashboard
+                # rollup (calculatedTotalCost, daily metrics totalCost) from
+                # this key, NOT from summing the per-type sub-buckets.
+                cost_details["total"] = float(cost.amount_usd)
             except Exception:
                 cost_details["total"] = float(cost.amount_usd)
     except Exception as exc:  # pragma: no cover - fail-open
