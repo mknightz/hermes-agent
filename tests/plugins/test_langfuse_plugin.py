@@ -168,3 +168,31 @@ class TestHooksInert:
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+
+
+class TestProviderQualifiedModel:
+    """Cost-routing prefix applied at the Langfuse trace boundary only."""
+
+    def _q(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")._provider_qualified_model
+
+    def test_normalizes_opencode_go_alias_to_opencode_zen(self):
+        assert self._q()("opencode-go", "kimi-k2.6") == "opencode-zen/kimi-k2.6"
+
+    def test_passes_other_providers_through_unchanged(self):
+        q = self._q()
+        assert q("openrouter", "kimi-k2.6") == "openrouter/kimi-k2.6"
+        assert q("openrouter", "moonshotai/kimi-k2.6-20260420") == "openrouter/moonshotai/kimi-k2.6-20260420"
+        assert q("anthropic", "claude-opus-4-7") == "anthropic/claude-opus-4-7"
+
+    def test_idempotent_when_already_prefixed(self):
+        q = self._q()
+        assert q("opencode-zen", "opencode-zen/kimi-k2.6") == "opencode-zen/kimi-k2.6"
+        # Idempotent through the alias too.
+        assert q("opencode-go", "opencode-zen/kimi-k2.6") == "opencode-zen/kimi-k2.6"
+
+    def test_returns_input_unchanged_when_provider_or_model_empty(self):
+        q = self._q()
+        assert q("", "kimi-k2.6") == "kimi-k2.6"
+        assert q("opencode-go", "") == ""

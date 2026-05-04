@@ -58,6 +58,28 @@ _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
 
+# Map auth-flow provider ids to their canonical billing-entity name so the
+# Langfuse model registry can split costs by provider.  Mirrors the
+# normalization in agent.usage_pricing.resolve_billing_route — keep in sync.
+_PROVIDER_BILLING_ALIASES = {"opencode-go": "opencode-zen"}
+
+
+def _provider_qualified_model(provider: str, model: str) -> str:
+    """Prefix the model name with the canonical billing provider.
+
+    When the same model id (e.g. ``kimi-k2.6``) is served by multiple
+    providers at different prices (opencode-zen vs openrouter), Langfuse's
+    model registry can only distinguish them via the ``model`` string.
+    Prefix at the trace boundary only — internal Hermes code keeps the
+    bare model id so config/auth/pricing logic stay simple.
+    """
+    if not model or not provider:
+        return model
+    canonical = _PROVIDER_BILLING_ALIASES.get(provider, provider)
+    if "/" in model and model.split("/", 1)[0] == canonical:
+        return model
+    return f"{canonical}/{model}"
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
@@ -683,7 +705,7 @@ def on_pre_llm_request(
                 "api_mode": api_mode,
                 "base_url": base_url,
             },
-            model=model,
+            model=_provider_qualified_model(provider, model),
             model_parameters={"api_mode": api_mode, "provider": provider},
         )
 
