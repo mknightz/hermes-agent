@@ -226,3 +226,37 @@ def test_opencode_zen_pricing_returns_none_for_unknown_model():
     # /models endpoint heuristics — that path returns wrong/empty data
     # for opencode-zen and would mask real pricing-table drift.
     assert get_pricing_entry("not-a-real-model", provider="opencode-go") is None
+
+
+def test_deepseek_v4_pro_pricing_entry_exists():
+    """Regression test: deepseek-v4-pro must have a pricing entry.
+
+    Before this fix, deepseek-v4-pro sessions showed as unknown cost
+    in hermes insights because the _OFFICIAL_DOCS_PRICING table had no
+    entry for that model.  See #24218.
+    """
+    entry = get_pricing_entry(
+        "deepseek-v4-pro",
+        provider="deepseek",
+    )
+
+    assert entry is not None
+    assert entry.input_cost_per_million is not None
+    assert entry.output_cost_per_million is not None
+    assert float(entry.input_cost_per_million) == 1.74
+    assert float(entry.output_cost_per_million) == 3.48
+    assert float(entry.cache_read_cost_per_million) == 0.0145
+
+
+def test_deepseek_v4_pro_estimate_usage_cost():
+    """Ensure deepseek-v4-pro sessions get a dollar estimate, not unknown."""
+    result = estimate_usage_cost(
+        "deepseek-v4-pro",
+        CanonicalUsage(input_tokens=1000000, output_tokens=500000),
+        provider="deepseek",
+    )
+
+    assert result.status == "estimated"
+    assert result.amount_usd is not None
+    # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
+    assert float(result.amount_usd) == 3.48
