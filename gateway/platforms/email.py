@@ -11,6 +11,8 @@ Environment variables:
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
     EMAIL_ADDRESS       — Email address for the agent
     EMAIL_PASSWORD      — Email password or app-specific password
+    EMAIL_FROM_ADDRESS  — Optional display From: address (e.g. a domain alias)
+    EMAIL_IMAP_FOLDER   — IMAP folder to poll (default: INBOX)
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 """
@@ -255,6 +257,10 @@ class EmailAdapter(BasePlatformAdapter):
         self._from_address = os.getenv("EMAIL_FROM_ADDRESS") or self._address
         self._imap_host = os.getenv("EMAIL_IMAP_HOST", "")
         self._imap_port = int(os.getenv("EMAIL_IMAP_PORT", "993"))
+        # Optional folder to poll instead of INBOX (e.g. a server-side rule
+        # routes this agent's mail into its own folder on a shared mailbox).
+        # Defaults to INBOX so existing deployments are unchanged.
+        self._imap_folder = os.getenv("EMAIL_IMAP_FOLDER", "INBOX")
         self._smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
         self._smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
         self._poll_interval = int(os.getenv("EMAIL_POLL_INTERVAL", "15"))
@@ -296,6 +302,24 @@ class EmailAdapter(BasePlatformAdapter):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
 
+    def _select_folder(self, imap) -> None:
+        """Select the configured IMAP folder, failing loudly if unavailable.
+
+        A missing or renamed folder must raise — not degrade into a poller
+        that silently watches nothing.
+        """
+        # Quote per RFC 3501 so folder names with spaces work.
+        quoted = '"%s"' % self._imap_folder.replace("\\", "\\\\").replace('"', '\\"')
+        status, data = imap.select(quoted)
+        if status != "OK":
+            detail = data[0].decode() if data and isinstance(data[0], bytes) else data
+            logger.error(
+                "[Email] IMAP select of folder %r failed: %s", self._imap_folder, detail
+            )
+            raise RuntimeError(
+                f"IMAP folder {self._imap_folder!r} not selectable: {detail}"
+            )
+
     async def connect(self) -> bool:
         """Connect to the IMAP server and start polling for new messages."""
         try:
@@ -304,7 +328,7 @@ class EmailAdapter(BasePlatformAdapter):
             imap.login(self._address, self._password)
             _send_imap_id(imap)
             # Mark all existing messages as seen so we only process new ones
-            imap.select("INBOX")
+            self._select_folder(imap)
             status, data = imap.uid("search", None, "ALL")
             if status == "OK" and data and data[0]:
                 for uid in data[0].split():
@@ -372,7 +396,7 @@ class EmailAdapter(BasePlatformAdapter):
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
-                imap.select("INBOX")
+                self._select_folder(imap)
 
                 status, data = imap.uid("search", None, "UNSEEN")
                 if status != "OK" or not data or not data[0]:
