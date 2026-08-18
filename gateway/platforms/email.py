@@ -15,6 +15,8 @@ Environment variables:
     EMAIL_IMAP_FOLDER   — IMAP folder to poll (default: INBOX)
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+    EMAIL_REPLY_ALL     — Cc the inbound thread's other participants on
+                          replies: "1"/"true"/"yes" (default: off)
 """
 
 import asyncio
@@ -30,10 +32,10 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, getaddresses
 from email import encoders
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -184,6 +186,31 @@ def _extract_email_address(raw: str) -> str:
     return raw.strip().lower()
 
 
+def _collect_participants(
+    msg: email_lib.message.Message,
+    sender_addr: str,
+    own_addresses: Iterable[str],
+) -> List[str]:
+    """Return the other human recipients of an inbound email.
+
+    Reads the raw To and Cc headers, lowercases every address and drops the
+    sender plus the agent's own identities, so a reply-all never Cc's us or
+    the person already on the To: line.  Order is preserved and duplicates
+    are removed.
+    """
+    raw_headers = msg.get_all("To", []) + msg.get_all("Cc", [])
+    excluded = {a.strip().lower() for a in own_addresses if a}
+    excluded.add(sender_addr.strip().lower())
+
+    participants: List[str] = []
+    for _name, addr in getaddresses(raw_headers):
+        addr = addr.strip().lower()
+        if not addr or addr in excluded or addr in participants:
+            continue
+        participants.append(addr)
+    return participants
+
+
 def _extract_attachments(
     msg: email_lib.message.Message,
     skip_attachments: bool = False,
@@ -264,6 +291,10 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_host = os.getenv("EMAIL_SMTP_HOST", "")
         self._smtp_port = int(os.getenv("EMAIL_SMTP_PORT", "587"))
         self._poll_interval = int(os.getenv("EMAIL_POLL_INTERVAL", "15"))
+        # Opt-in reply-all: also Cc the inbound thread's other participants so
+        # someone cc'd on the question sees the answer (shared household /
+        # small-team mailboxes).  Defaults off so replies stay To: sender only.
+        self._reply_all = os.getenv("EMAIL_REPLY_ALL", "").strip().lower() in {"1", "true", "yes"}
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -278,7 +309,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        # (plus the thread's other participants when reply-all is enabled)
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -450,6 +482,11 @@ class EmailAdapter(BasePlatformAdapter):
                         continue
                     body = _extract_text_body(msg)
                     attachments = _extract_attachments(msg, skip_attachments=self._skip_attachments)
+                    # Other humans on this thread (To + Cc, minus us and the
+                    # sender) — used by the opt-in reply-all Cc on send.
+                    participants = _collect_participants(
+                        msg, sender_addr, (self._address, self._from_address)
+                    )
 
                     results.append({
                         "uid": uid,
@@ -460,6 +497,7 @@ class EmailAdapter(BasePlatformAdapter):
                         "in_reply_to": in_reply_to,
                         "body": body,
                         "attachments": attachments,
+                        "participants": participants,
                         "date": msg.get("Date", ""),
                     })
             finally:
@@ -520,6 +558,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._thread_context[sender_addr] = {
             "subject": subject,
             "message_id": msg_data["message_id"],
+            "participants": msg_data.get("participants") or [],
         }
 
         source = self.build_source(
@@ -574,6 +613,16 @@ class EmailAdapter(BasePlatformAdapter):
 
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
+
+        # Opt-in reply-all: Cc the thread's other participants so whoever was
+        # cc'd on the question also gets the answer.  smtplib's send_message()
+        # derives the envelope recipients from the To/Cc headers, so setting
+        # the header is enough — no explicit recipient list to keep in sync.
+        if self._reply_all:
+            participants = [p for p in (ctx.get("participants") or []) if p]
+            if participants:
+                msg["Cc"] = ", ".join(participants)
+
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"

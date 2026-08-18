@@ -1266,3 +1266,183 @@ class TestImapFolderSelection(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             adapter._select_folder(imap)
         self.assertIn("Missing", str(ctx.exception))
+
+
+class TestReplyAllCc(unittest.TestCase):
+    """Test opt-in EMAIL_REPLY_ALL: replies Cc the inbound thread's others.
+
+    Default off — with the flag unset the adapter must behave exactly as it
+    did before (To: sender only, no Cc header anywhere).
+    """
+
+    AGENT = "hermes@test.com"
+    SENDER = "mygelknightz@gmail.com"
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = {
+            "EMAIL_ADDRESS": self.AGENT,
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False):
+            # Don't inherit these from the ambient environment
+            for key in ("EMAIL_REPLY_ALL", "EMAIL_FROM_ADDRESS", "EMAIL_ALLOWED_USERS"):
+                if key not in env:
+                    os.environ.pop(key, None)
+            from gateway.platforms.email import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def _inbound(self, adapter, to_hdr, cc_hdr=None, sender=None):
+        """Push one raw inbound email through fetch + dispatch."""
+        import asyncio
+        sender = sender or self.SENDER
+
+        raw_email = MIMEText("Any updates on this?", "plain", "utf-8")
+        raw_email["From"] = f"Mygel <{sender}>"
+        raw_email["To"] = to_hdr
+        if cc_hdr:
+            raw_email["Cc"] = cc_hdr
+        raw_email["Subject"] = "Dinner plans"
+        raw_email["Message-ID"] = "<inbound@test.com>"
+
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                return ("OK", [(b"1", raw_email.as_bytes())])
+            return ("NO", [])
+
+        mock_imap.uid.side_effect = uid_handler
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages()
+
+        async def noop_handle(event):
+            pass
+
+        adapter.handle_message = noop_handle
+        for msg_data in results:
+            asyncio.run(adapter._dispatch_message(msg_data))
+        return results
+
+    def _reply(self, adapter, to_addr=None):
+        """Run the reply send path and return (sent message, smtp mock)."""
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email(to_addr or self.SENDER, "Here is the answer.", None)
+            return mock_server.send_message.call_args, mock_server
+
+    def test_flag_defaults_off(self):
+        """Without EMAIL_REPLY_ALL the adapter keeps its old behavior."""
+        adapter = self._make_adapter()
+        self.assertFalse(adapter._reply_all)
+
+    def test_flag_truthy_values(self):
+        for value in ("1", "true", "TRUE", "Yes"):
+            with self.subTest(value=value):
+                adapter = self._make_adapter({"EMAIL_REPLY_ALL": value})
+                self.assertTrue(adapter._reply_all)
+        for value in ("0", "false", "no", "", "  "):
+            with self.subTest(value=value):
+                adapter = self._make_adapter({"EMAIL_REPLY_ALL": value})
+                self.assertFalse(adapter._reply_all)
+
+    def test_flag_off_never_ccs(self):
+        """Flag off: no Cc header even when the inbound had Cc participants."""
+        adapter = self._make_adapter()
+        self._inbound(
+            adapter,
+            to_hdr=f"Hermes <{self.AGENT}>",
+            cc_hdr="Deliana <deliana@example.com>",
+        )
+
+        call_args, _ = self._reply(adapter)
+        sent = call_args[0][0]
+        self.assertIsNone(sent["Cc"])
+        self.assertEqual(sent["To"], self.SENDER)
+
+    def test_flag_on_ccs_other_participants(self):
+        """Flag on: the cc'd human on the question gets cc'd on the answer."""
+        adapter = self._make_adapter({"EMAIL_REPLY_ALL": "true"})
+        self._inbound(
+            adapter,
+            to_hdr=f"Hermes <{self.AGENT}>",
+            cc_hdr="Deliana <deliana@example.com>",
+        )
+
+        ctx = adapter._thread_context[self.SENDER]
+        self.assertEqual(ctx["participants"], ["deliana@example.com"])
+
+        call_args, mock_server = self._reply(adapter)
+        sent = call_args[0][0]
+        self.assertEqual(sent["Cc"], "deliana@example.com")
+        self.assertEqual(sent["To"], self.SENDER)
+        # The send path relies on smtplib deriving envelope recipients from
+        # the To/Cc headers — no explicit recipient list is passed.
+        self.assertEqual(len(call_args[0]), 1)
+        self.assertEqual(call_args[1], {})
+
+    def test_flag_on_no_other_participants_no_cc(self):
+        """Flag on but nobody else on the thread: no Cc header at all."""
+        adapter = self._make_adapter({"EMAIL_REPLY_ALL": "1"})
+        self._inbound(adapter, to_hdr=f"Hermes <{self.AGENT}>")
+
+        ctx = adapter._thread_context[self.SENDER]
+        self.assertEqual(ctx["participants"], [])
+
+        call_args, _ = self._reply(adapter)
+        sent = call_args[0][0]
+        self.assertIsNone(sent["Cc"])
+
+    def test_agent_own_addresses_and_sender_excluded(self):
+        """The agent's own identities and the sender are never participants."""
+        adapter = self._make_adapter({
+            "EMAIL_REPLY_ALL": "yes",
+            "EMAIL_FROM_ADDRESS": "agent@alias.test",
+        })
+        self._inbound(
+            adapter,
+            to_hdr=f"Hermes <{self.AGENT}>, Agent Alias <agent@alias.test>",
+            cc_hdr=f"MYGELKNIGHTZ@gmail.com, Deliana <Deliana@Example.com>",
+        )
+
+        ctx = adapter._thread_context[self.SENDER]
+        self.assertEqual(ctx["participants"], ["deliana@example.com"])
+
+        call_args, _ = self._reply(adapter)
+        sent = call_args[0][0]
+        self.assertEqual(sent["Cc"], "deliana@example.com")
+        self.assertNotIn(self.AGENT, sent["Cc"])
+        self.assertNotIn("alias.test", sent["Cc"])
+
+    def test_multiple_participants_joined(self):
+        """Several other recipients are joined into one Cc header, deduped."""
+        adapter = self._make_adapter({"EMAIL_REPLY_ALL": "true"})
+        self._inbound(
+            adapter,
+            to_hdr=f"Hermes <{self.AGENT}>, Deliana <deliana@example.com>",
+            cc_hdr="deliana@example.com, Tia <tia@example.com>",
+        )
+
+        ctx = adapter._thread_context[self.SENDER]
+        self.assertEqual(ctx["participants"], ["deliana@example.com", "tia@example.com"])
+
+        call_args, _ = self._reply(adapter)
+        sent = call_args[0][0]
+        self.assertEqual(sent["Cc"], "deliana@example.com, tia@example.com")
+
+    def test_no_thread_context_no_cc(self):
+        """Flag on but replying to an address with no stored thread: no Cc."""
+        adapter = self._make_adapter({"EMAIL_REPLY_ALL": "true"})
+        call_args, _ = self._reply(adapter, "stranger@example.com")
+        sent = call_args[0][0]
+        self.assertIsNone(sent["Cc"])
