@@ -253,6 +253,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             pass
         return []
 
+    @staticmethod
+    def _redact_url(url: str) -> str:
+        """Hide the ``password`` query parameter before a URL reaches the logs."""
+        return re.sub(r"(password=)[^&]+", r"\1***", url)
+
     async def _register_webhook(self) -> bool:
         """Register this webhook URL with the BlueBubbles server.
 
@@ -269,7 +274,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         existing = await self._find_registered_webhooks(webhook_url)
         if existing:
             logger.info(
-                "[bluebubbles] webhook already registered: %s", webhook_url
+                "[bluebubbles] webhook already registered: %s", self._redact_url(webhook_url)
             )
             return True
 
@@ -284,7 +289,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if 200 <= status < 300:
                 logger.info(
                     "[bluebubbles] webhook registered with server: %s",
-                    webhook_url,
+                    self._redact_url(webhook_url),
                 )
                 return True
             else:
@@ -324,7 +329,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     removed = True
             if removed:
                 logger.info(
-                    "[bluebubbles] webhook unregistered: %s", webhook_url
+                    "[bluebubbles] webhook unregistered: %s", self._redact_url(webhook_url)
                 )
         except Exception as exc:
             logger.debug(
