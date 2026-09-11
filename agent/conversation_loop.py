@@ -228,6 +228,7 @@ def run_conversation(
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
+            session_id=getattr(agent, "session_id", None),
         )
     except Exception:
         pass

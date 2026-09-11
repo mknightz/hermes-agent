@@ -35,6 +35,7 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.opencode_affinity import merge_opencode_session_headers
 from agent.model_metadata import is_local_endpoint
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -231,7 +232,25 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def build_api_kwargs(agent, api_messages: list) -> dict:
-    """Build the keyword arguments dict for the active API mode."""
+    """Build the keyword arguments dict for the active API mode.
+
+    Wraps the per-api_mode builder so the OpenCode ``x-opencode-session``
+    affinity header rides on every OpenCode request regardless of transport
+    (chat_completions / codex_responses / anthropic_messages all route
+    OpenCode models). No-op for every other provider. OpenCode Go rejects
+    header-less requests with HTTP 400 MissingSessionID since 2026-09-08.
+    """
+    kwargs = _build_api_kwargs_for_mode(agent, api_messages)
+    return merge_opencode_session_headers(
+        kwargs,
+        getattr(agent, "provider", None),
+        getattr(agent, "base_url", None),
+        getattr(agent, "session_id", None),
+    )
+
+
+def _build_api_kwargs_for_mode(agent, api_messages: list) -> dict:
+    """Build the keyword arguments dict for the active API mode (per transport)."""
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -1056,10 +1075,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                is_oauth=agent._is_anthropic_oauth,
                                preserve_dots=agent._anthropic_preserve_dots())
+                merge_opencode_session_headers(_ant_kw, agent.provider, agent.base_url, getattr(agent, "session_id", None))
                 summary_response = agent._anthropic_messages_create(_ant_kw)
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
+                merge_opencode_session_headers(summary_kwargs, agent.provider, agent.base_url, getattr(agent, "session_id", None))
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
@@ -1086,6 +1107,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                                 is_oauth=agent._is_anthropic_oauth,
                                 max_tokens=agent.max_tokens, reasoning_config=agent.reasoning_config,
                                 preserve_dots=agent._anthropic_preserve_dots())
+                merge_opencode_session_headers(_ant_kw2, agent.provider, agent.base_url, getattr(agent, "session_id", None))
                 retry_response = agent._anthropic_messages_create(_ant_kw2)
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_retry_result.content or "").strip()
@@ -1103,6 +1125,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
+                merge_opencode_session_headers(summary_kwargs, agent.provider, agent.base_url, getattr(agent, "session_id", None))
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()

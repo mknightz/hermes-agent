@@ -83,6 +83,11 @@ def clear_session_context() -> None:
     _session_context.session_id = None
 
 
+def get_session_context() -> Optional[str]:
+    """Return the session ID set for the current thread, or ``None``."""
+    return getattr(_session_context, "session_id", None)
+
+
 # ---------------------------------------------------------------------------
 # Record factory — injects session_tag into every LogRecord at creation
 # ---------------------------------------------------------------------------

@@ -668,6 +668,10 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        # Per-request HTTP headers (OpenCode session affinity, Copilot
+        # x-initiator) map to real headers via the SDK kwarg — forward them.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            resp_kwargs["extra_headers"] = dict(kwargs["extra_headers"])
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -1014,6 +1018,13 @@ class _AnthropicCompletionsAdapter:
             from agent.anthropic_adapter import _forbids_sampling_params
             if not _forbids_sampling_params(model):
                 anthropic_kwargs["temperature"] = temperature
+        # Per-request HTTP headers (OpenCode session affinity) — the Anthropic
+        # SDK accepts ``extra_headers`` on messages.create too.
+        if isinstance(kwargs.get("extra_headers"), dict) and kwargs["extra_headers"]:
+            anthropic_kwargs["extra_headers"] = {
+                **(anthropic_kwargs.get("extra_headers") or {}),
+                **kwargs["extra_headers"],
+            }
 
         response = self._client.messages.create(**anthropic_kwargs)
         _transport = get_transport("anthropic_messages")
@@ -1671,9 +1682,10 @@ def _read_main_provider() -> str:
 # per turn — no lock needed. Cleared by ``clear_runtime_main()``.
 _RUNTIME_MAIN_PROVIDER: str = ""
 _RUNTIME_MAIN_MODEL: str = ""
+_RUNTIME_MAIN_SESSION_ID: str = ""
 
 
-def set_runtime_main(provider: str, model: str) -> None:
+def set_runtime_main(provider: str, model: str, session_id: Optional[str] = None) -> None:
     """Record the live runtime provider/model for the current AIAgent.
 
     Called by ``run_agent.AIAgent._sync_runtime_main_for_aux_routing`` (or
@@ -1681,16 +1693,36 @@ def set_runtime_main(provider: str, model: str) -> None:
     ``_read_main_provider`` / ``_read_main_model`` reflect CLI/gateway
     overrides instead of the stale config.yaml default.
     """
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL, _RUNTIME_MAIN_SESSION_ID
     _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
     _RUNTIME_MAIN_MODEL = (model or "").strip()
+    _RUNTIME_MAIN_SESSION_ID = str(session_id or "").strip()
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
+    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL, _RUNTIME_MAIN_SESSION_ID
     _RUNTIME_MAIN_PROVIDER = ""
     _RUNTIME_MAIN_MODEL = ""
+    _RUNTIME_MAIN_SESSION_ID = ""
+
+
+def _runtime_session_id_for_affinity() -> str:
+    """Best-effort session id for auxiliary-call affinity headers.
+
+    The gateway runs several conversations concurrently on different
+    threads, so the per-thread logging session context (set at the top of
+    every turn) is consulted first; the process-wide runtime-main override
+    is the fallback for auxiliary work that runs off the turn thread.
+    """
+    try:
+        from hermes_logging import get_session_context
+        sid = get_session_context()
+        if isinstance(sid, str) and sid.strip():
+            return sid.strip()
+    except Exception:
+        pass
+    return _RUNTIME_MAIN_SESSION_ID
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -4532,7 +4564,14 @@ def _build_call_kwargs(
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
-    return kwargs
+    # OpenCode relay session affinity — same key as the main turn so
+    # compression/title/vision calls stay on the conversation's warm backend
+    # (and clear Go's hard MissingSessionID gate).
+    from agent.opencode_affinity import merge_opencode_session_headers
+
+    return merge_opencode_session_headers(
+        kwargs, provider, base_url, _runtime_session_id_for_affinity() or None
+    )
 
 
 def _validate_llm_response(response: Any, task: str = None) -> Any:
