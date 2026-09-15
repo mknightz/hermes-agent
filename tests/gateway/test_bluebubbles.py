@@ -691,3 +691,64 @@ class TestBlueBubblesWebhookRegistration:
             adapter._unregister_webhook()
         )
         assert ok is False
+
+
+class TestBlueBubblesAccessLogRedaction:
+    """The webhook URL registered with BlueBubbles carries the server password
+    as a query parameter (its webhook API has no header support), so aiohttp's
+    default access-log format — which logs the full request line — would leak
+    the password on every inbound event. Regression: the access log line for a
+    webhook POST must contain no password.
+    """
+
+    @pytest.mark.asyncio
+    async def test_webhook_access_log_omits_password(self, monkeypatch, caplog):
+        import logging
+        import socket
+
+        import aiohttp
+
+        # webhook_port=0 is falsy and would fall back to the default port, so
+        # grab a genuinely free port instead.
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+
+
+        async def fake_api_get(path):
+            return {}
+
+        async def fake_register():
+            return True
+
+        adapter = _make_adapter(
+            monkeypatch, webhook_port=free_port, webhook_host="127.0.0.1"
+        )
+        adapter._api_get = fake_api_get
+        adapter._register_webhook = fake_register
+
+        assert await adapter.connect() is True
+        try:
+            port = adapter._runner.addresses[0][1]
+            url = (
+                f"http://127.0.0.1:{port}{adapter.webhook_path}"
+                f"?password={adapter.password}"
+            )
+
+            with caplog.at_level(logging.INFO, logger="aiohttp.access"):
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.post(url, json={"type": "ping"}) as resp:
+                        assert resp.status == 200
+
+            access_records = [
+                r for r in caplog.records if r.name == "aiohttp.access"
+            ]
+            # The access line must actually be emitted — the fix redacts the
+            # request line, it does not disable the access log.
+            assert access_records, "expected at least one aiohttp.access record"
+            for record in access_records:
+                msg = record.getMessage()
+                assert "password=" not in msg
+                assert adapter.password not in msg
+        finally:
+            await adapter.disconnect()

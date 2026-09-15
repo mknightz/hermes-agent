@@ -189,7 +189,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         app = web.Application()
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
-        self._runner = web.AppRunner(app)
+        # BlueBubbles webhooks carry the server password as a query parameter
+        # (its webhook API has no header support), so the default access-log
+        # format — which logs the full request line — would leak that password
+        # on every inbound event. Log client, time, status and size only.
+        self._runner = web.AppRunner(app, access_log_format="%a %t %s %b")
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.webhook_host, self.webhook_port)
         await site.start()
