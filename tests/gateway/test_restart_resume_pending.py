@@ -872,7 +872,17 @@ async def test_drain_timeout_only_marks_still_running_sessions(tmp_path):
     1. Pre-drain (#27856) markers of sessions that finish mid-drain are
        cleared even when the drain as a whole times out.
     2. The timeout branch marks the CURRENT ``_running_agents``
-       membership, not the drain-start snapshot.
+       membership, not the drain-start snapshot — with the correct
+       restart/shutdown reason.
+
+    The stuck session's pre-drain mark is made to FAIL (injected, once —
+    the pre-drain loop marks each drain-start key exactly once, so its
+    first call for that key is deterministically the pre-drain one).
+    Every end-state assertion below is therefore produced by the
+    timeout-branch re-mark alone: without it (e.g. the dangling
+    ``_resume_reason`` NameError this guard was written for) the stuck
+    session ends unmarked and the test goes red instead of passing
+    vacuously on the pre-drain mark.
     """
     store = _make_store(tmp_path)
     finisher_entry = store.get_or_create_session(_make_source(chat_id="A"))
@@ -890,6 +900,18 @@ async def test_drain_timeout_only_marks_still_running_sessions(tmp_path):
         stuck_entry.session_key: MagicMock(),
     }
 
+    real_mark = store.mark_resume_pending
+    stuck_pre_drain_failed = False
+
+    def mark_failing_stuck_pre_drain(session_key, *args, **kwargs):
+        nonlocal stuck_pre_drain_failed
+        if session_key == stuck_entry.session_key and not stuck_pre_drain_failed:
+            stuck_pre_drain_failed = True
+            raise RuntimeError("injected pre-drain mark failure (stuck session)")
+        return real_mark(session_key, *args, **kwargs)
+
+    store.mark_resume_pending = mark_failing_stuck_pre_drain  # type: ignore[method-assign]
+
     async def finish_one():
         await asyncio.sleep(0.05)
         runner._running_agents.pop(finisher_entry.session_key, None)
@@ -901,6 +923,7 @@ async def test_drain_timeout_only_marks_still_running_sessions(tmp_path):
     ):
         await runner.stop()
 
+    assert stuck_pre_drain_failed, "injected pre-drain failure must have fired"
     assert store._entries[finisher_entry.session_key].resume_pending is False
     stuck = store._entries[stuck_entry.session_key]
     assert stuck.resume_pending is True
