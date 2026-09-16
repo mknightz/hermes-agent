@@ -821,14 +821,28 @@ async def test_drain_timeout_uses_restart_reason_when_restarting():
 
 
 @pytest.mark.asyncio
-async def test_clean_drain_does_not_mark_resume_pending():
+async def test_clean_drain_does_not_mark_resume_pending(tmp_path):
     """If the drain completes within timeout (no force-interrupt), no
-    sessions should be flagged — the normal shutdown path is unchanged."""
+    session may still CARRY ``resume_pending`` — a session that finishes
+    during the drain window completed cleanly, and its next turn must be
+    a normal fresh turn, not one prefixed with the restart-interruption
+    system note.
+
+    Asserts the END STATE through a real SessionStore rather than mock
+    call history: the #27856 pre-drain mark legitimately fires before
+    the drain wait starts, so whether that mark lands before or after
+    the agent finishes is a scheduling race. The graceful clear after
+    the drain is what must absorb it.
+    """
+    store = _make_store(tmp_path)
+    entry = store.get_or_create_session(_make_source(chat_id="A"))
+
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
+    runner.session_store = store
 
     running_agent = MagicMock()
-    runner._running_agents = {"agent:main:telegram:dm:A": running_agent}
+    runner._running_agents = {entry.session_key: running_agent}
 
     # Finish the agent before the (generous) drain deadline
     async def finish_agent():
@@ -837,61 +851,60 @@ async def test_clean_drain_does_not_mark_resume_pending():
 
     asyncio.create_task(finish_agent())
 
-    session_store = MagicMock()
-    session_store.mark_resume_pending = MagicMock(return_value=True)
-    runner.session_store = session_store
-
     with patch("gateway.status.remove_pid_file"), patch(
         "gateway.status.write_runtime_status"
     ):
         await runner.stop()
 
-    session_store.mark_resume_pending.assert_not_called()
+    assert store._entries[entry.session_key].resume_pending is False
     running_agent.interrupt.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_drain_timeout_only_marks_still_running_sessions():
+async def test_drain_timeout_only_marks_still_running_sessions(tmp_path):
     """A session that finished gracefully during the drain window must
-    NOT be marked ``resume_pending`` — it completed cleanly and its
-    next turn should be a normal fresh turn, not one prefixed with the
-    restart-interruption system note.
+    NOT carry ``resume_pending`` after a timed-out drain — it completed
+    cleanly and its next turn should be a normal fresh turn. Only
+    sessions still running at the timeout carry the
+    restart-interruption marker into their next turn.
 
-    Regression guard for using ``self._running_agents`` at timeout
-    rather than the ``active_agents`` drain-start snapshot.
+    Guards two production invariants together:
+    1. Pre-drain (#27856) markers of sessions that finish mid-drain are
+       cleared even when the drain as a whole times out.
+    2. The timeout branch marks the CURRENT ``_running_agents``
+       membership, not the drain-start snapshot.
     """
+    store = _make_store(tmp_path)
+    finisher_entry = store.get_or_create_session(_make_source(chat_id="A"))
+    stuck_entry = store.get_or_create_session(_make_source(chat_id="B"))
+
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
     # Long enough for the finisher to exit, short enough to still time out
     # with the stuck session still present.
     runner._restart_drain_timeout = 0.3
+    runner.session_store = store
 
-    session_key_finisher = "agent:main:telegram:dm:A"
-    session_key_stuck = "agent:main:telegram:dm:B"
     runner._running_agents = {
-        session_key_finisher: MagicMock(),
-        session_key_stuck: MagicMock(),
+        finisher_entry.session_key: MagicMock(),
+        stuck_entry.session_key: MagicMock(),
     }
 
     async def finish_one():
         await asyncio.sleep(0.05)
-        runner._running_agents.pop(session_key_finisher, None)
+        runner._running_agents.pop(finisher_entry.session_key, None)
 
     asyncio.create_task(finish_one())
-
-    session_store = MagicMock()
-    session_store.mark_resume_pending = MagicMock(return_value=True)
-    runner.session_store = session_store
 
     with patch("gateway.status.remove_pid_file"), patch(
         "gateway.status.write_runtime_status"
     ):
         await runner.stop()
 
-    calls = session_store.mark_resume_pending.call_args_list
-    marked = {args[0][0] for args in calls}
-    # Only the session still running at timeout is marked; the finisher is not.
-    assert marked == {session_key_stuck}
+    assert store._entries[finisher_entry.session_key].resume_pending is False
+    stuck = store._entries[stuck_entry.session_key]
+    assert stuck.resume_pending is True
+    assert stuck.resume_reason == "shutdown_timeout"
 
 
 @pytest.mark.asyncio

@@ -5612,8 +5612,13 @@ class GatewayRunner:
             # If the process is killed by the service manager during the
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
+            #
+            # Snapshot the drain-START membership and iterate that: the
+            # drain pops sessions as they finish, so iterating the live
+            # _running_agents here would race with mid-drain completions.
+            _drain_start_agents: dict[str, Any] = dict(self._running_agents)
             _pre_drain_keys: list[str] = []
-            for _sk, _agent in list(self._running_agents.items()):
+            for _sk, _agent in list(_drain_start_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
                 try:
@@ -5637,19 +5642,22 @@ class GatewayRunner:
                 self._running_agent_count(),
             )
 
-            if not timed_out:
-                # Drain completed gracefully — all running sessions finished.
-                # Clear the pre-drain resume_pending markers so sessions that
-                # completed during the drain window don't carry a stale flag.
-                for _sk in _pre_drain_keys:
-                    if _sk not in self._running_agents:
-                        try:
-                            self.session_store.clear_resume_pending(_sk)
-                        except Exception as _e:
-                            logger.debug(
-                                "clear_resume_pending after drain failed for %s: %s",
-                                _sk, _e,
-                            )
+            # Clear the pre-drain resume_pending markers for sessions that
+            # finished during the drain window — they completed cleanly and
+            # must not carry a stale flag into their next turn. The same
+            # condition holds when the drain times out: sessions that
+            # finished mid-drain are exactly the pre-drain keys no longer
+            # in _running_agents, while still-running sessions keep their
+            # marker (they are about to be interrupted).
+            for _sk in _pre_drain_keys:
+                if _sk not in self._running_agents:
+                    try:
+                        self.session_store.clear_resume_pending(_sk)
+                    except Exception as _e:
+                        logger.debug(
+                            "clear_resume_pending after drain failed for %s: %s",
+                            _sk, _e,
+                        )
 
             if timed_out:
                 logger.warning(
@@ -5678,9 +5686,6 @@ class GatewayRunner:
                 # _interrupt_running_agents() does: their agent hasn't
                 # started yet, there's nothing to interrupt, and the
                 # session shouldn't carry a misleading resume flag.
-                _resume_reason = (
-                    "restart_timeout" if self._restart_requested else "shutdown_timeout"
-                )
                 for _sk, _agent in list(self._running_agents.items()):
                     if _agent is _AGENT_PENDING_SENTINEL:
                         continue
