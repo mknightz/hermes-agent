@@ -729,3 +729,128 @@ class TestProxyKwargsForAiohttp:
             assert sess_kw == {}
             assert req_kw == {"proxy": "http://proxy:8080"}
 
+
+
+# ---------------------------------------------------------------------------
+# [[silent]] directive — verdict of silence suppresses the reply
+# ---------------------------------------------------------------------------
+
+
+class TestUnwrapSilentDirective:
+    """unwrap_silent_directive: bare [[silent]] suppresses; mixed text passes."""
+
+    def test_pure_marker_suppresses(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        assert unwrap_silent_directive("[[silent]]") == (None, True)
+
+    def test_marker_case_and_whitespace_insensitive(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        assert unwrap_silent_directive("  [[SILENT]]  \n") == (None, True)
+
+    def test_no_marker_untouched(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        assert unwrap_silent_directive("Same band, no material change.") == (
+            "Same band, no material change.",
+            False,
+        )
+
+    def test_none_response_untouched(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        assert unwrap_silent_directive(None) == (None, False)
+        assert unwrap_silent_directive("") == ("", False)
+
+    def test_marker_alongside_text_strips_marker_keeps_text(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        cleaned, silent = unwrap_silent_directive(
+            "[[silent]] swap stable — same diagnosis as before"
+        )
+        assert silent is False
+        assert cleaned == "swap stable — same diagnosis as before"
+
+    def test_mixed_marker_never_swallows_text(self):
+        from gateway.platforms.base import unwrap_silent_directive
+
+        substantive = "Disk is 89%: Immich library is the driver, fix queued."
+        cleaned, silent = unwrap_silent_directive(f"{substantive} [[silent]]")
+        assert silent is False
+        assert cleaned == substantive
+
+
+class TestSilentDirectiveDelivery:
+    """A bare [[silent]] final response must send nothing; text must send."""
+
+    def _make_adapter(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+
+        class _ConcreteAdapter(BasePlatformAdapter):
+            platform = Platform.TELEGRAM
+
+            async def connect(self):
+                pass
+
+            async def disconnect(self):
+                pass
+
+            async def send(self, chat_id, content, **kwargs):
+                self.sent.append((chat_id, content))
+                return SendResult(success=True, message_id="m")
+
+            async def get_chat_info(self, chat_id):
+                return {}
+
+        adapter = _ConcreteAdapter(
+            PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM
+        )
+        adapter.sent = []
+        return adapter
+
+    async def _run(self, adapter, handler_response):
+        import asyncio
+
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+
+        async def fake_handler(event):
+            return handler_response
+
+        adapter.set_message_handler(fake_handler)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="u1",
+            chat_id="c1",
+            user_name="tester",
+            chat_type="dm",
+        )
+        event = MessageEvent(text="hello", source=source, message_id="m1")
+        await adapter.handle_message(event)
+        tasks = list(adapter._background_tasks)
+        assert tasks, "expected background task to be created"
+        await asyncio.gather(*tasks)
+
+    @pytest.mark.asyncio
+    async def test_silent_verdict_sends_nothing(self):
+        adapter = self._make_adapter()
+        await self._run(adapter, "[[silent]]")
+        assert adapter.sent == []
+
+    @pytest.mark.asyncio
+    async def test_normal_response_still_sends(self):
+        adapter = self._make_adapter()
+        await self._run(adapter, "Disk is 89% — Immich library, fix queued.")
+        assert len(adapter.sent) == 1
+        assert "Immich library" in adapter.sent[0][1]
+
+    @pytest.mark.asyncio
+    async def test_marker_alongside_text_sends_text_without_marker(self):
+        adapter = self._make_adapter()
+        await self._run(adapter, "Load is 17.1 — Immich ML grinding. [[silent]]")
+        assert len(adapter.sent) == 1
+        assert "[[silent]]" not in adapter.sent[0][1]
+        assert "Immich ML" in adapter.sent[0][1]

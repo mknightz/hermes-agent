@@ -518,6 +518,34 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     return f"{safe[:max_len - 3]}..."
 
 
+SILENT_DIRECTIVE = "[[silent]]"
+SILENT_DIRECTIVE_RE = re.compile(r"\[\[silent\]\]", re.IGNORECASE)
+
+
+def unwrap_silent_directive(response):
+    """Apply the ``[[silent]]`` directive to a handler response.
+
+    The directive lets the agent deliver a *verdict of silence*: when the
+    final response consists of the marker alone (case/whitespace-insensitive),
+    the gateway sends nothing and logs the verdict instead. That is the
+    difference between "I judged that no reply is warranted" and an email
+    announcing the fact — without this seam the verdict itself was delivered
+    as a reply (e.g. "Same band, no material change. Silent.").
+
+    Any other text alongside the marker keeps the response: the marker is
+    stripped and the remaining text is delivered as usual, so a substantive
+    reply can never be swallowed by a stray marker.
+
+    Returns ``(response, silent_verdict)``.
+    """
+    if not response or SILENT_DIRECTIVE not in response.lower():
+        return response, False
+    without_marker = SILENT_DIRECTIVE_RE.sub("", response).strip()
+    if without_marker:
+        return without_marker, False
+    return None, True
+
+
 async def _ssrf_redirect_guard(response):
     """Re-validate each redirect target to prevent redirect-based SSRF.
 
@@ -3134,6 +3162,18 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+
+            # Silent verdict: the agent judged that no reply is warranted
+            # (e.g. a repeat of an automated alert it already triaged) and
+            # said so with the bare [[silent]] directive. Send nothing — the
+            # verdict is logged here instead of being delivered as a reply.
+            response, _silent_verdict = unwrap_silent_directive(response)
+            if _silent_verdict:
+                logger.info(
+                    "[%s] Silent verdict — sending no reply to %s (agent judged none warranted)",
+                    self.name,
+                    event.source.chat_id,
+                )
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
