@@ -152,15 +152,20 @@ def test_config_timezone_wins_over_stale_env(hermes_home: Path) -> None:
     assert env.get("HERMES_TIMEZONE") == "America/Los_Angeles"
 
 
-def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
-    """If config.yaml doesn't set max_turns, .env value must still pass through.
+def test_import_does_not_load_env_values(hermes_home: Path) -> None:
+    """Importing gateway.run must NOT pull .env values into the environment.
 
-    The bridge only overwrites when the config key is present — an absent
-    config key should NOT clobber the .env value.
+    The .env load used to run at module import, so the pytest suite
+    inherited the real user environment and test outcomes depended on the
+    machine they ran on. Loading is deferred to runtime paths
+    (start_gateway → _load_runtime_env, and the per-turn
+    _reload_runtime_env_preserving_config_authority); the "absent config
+    key does not clobber the .env value" property is pinned at the reload
+    path by tests/gateway/test_runtime_env_reload_config_authority.py.
     """
     _write_config(hermes_home, agent_cfg={})  # no max_turns
     _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "123"})
 
     env = _run_gateway_import(hermes_home, initial_env={})
 
-    assert env.get("HERMES_MAX_ITERATIONS") == "123"
+    assert env.get("HERMES_MAX_ITERATIONS") is None

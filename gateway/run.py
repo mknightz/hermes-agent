@@ -552,12 +552,31 @@ from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
-# Load environment variables from ~/.hermes/.env first.
-# User-managed env files should override stale shell exports on restart.
-from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+# Kept as module attributes: tests patch ``gateway_run._env_path`` /
+# ``gateway_run.load_dotenv`` to neutralize env loading during unit tests
+# (the load itself never read these — load_hermes_dotenv derives paths
+# from hermes_home — but the attributes must exist for monkeypatch).
+from dotenv import load_dotenv  # noqa: F401
+_env_path = _hermes_home / '.env'  # noqa: F401
+# Environment loading is deferred: importing gateway.run must not mutate
+# os.environ. The pytest suite imports this module wholesale, so an
+# import-time dotenv load made test outcomes depend on the ambient
+# machine (real credentials leaking into the suite). Runtime paths call
+# _load_runtime_env() on demand — the startup config bridge and the
+# per-turn reload below — keeping the user-env-wins-over-stale-shell-exports
+# behaviour (#27856-era restarts) for the live gateway.
 from hermes_cli.env_loader import load_hermes_dotenv
-_env_path = _hermes_home / '.env'
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+
+
+def _load_runtime_env() -> None:
+    """Load ~/.hermes/.env (user values override stale shell exports) plus
+    the project .env fallback. Deferred out of module import — see the
+    comment above.
+    """
+    load_hermes_dotenv(
+        hermes_home=_hermes_home,
+        project_env=Path(__file__).resolve().parents[1] / '.env',
+    )
 
 
 def _reload_runtime_env_preserving_config_authority() -> None:
@@ -568,10 +587,7 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     settings such as agent.max_turns; otherwise a stale HERMES_MAX_ITERATIONS in
     .env can replace the startup bridge on later turns.
     """
-    load_hermes_dotenv(
-        hermes_home=_hermes_home,
-        project_env=Path(__file__).resolve().parents[1] / '.env',
-    )
+    _load_runtime_env()
 
     config_path = _hermes_home / 'config.yaml'
     if not config_path.exists():
@@ -593,10 +609,19 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
-# Bridge config.yaml values into the environment so os.getenv() picks them up.
-# config.yaml is authoritative for terminal settings — overrides .env.
-_config_path = _hermes_home / 'config.yaml'
-if _config_path.exists():
+def _bridge_config_to_env() -> None:
+    """Bridge config.yaml values into the environment so os.getenv() picks
+    them up. config.yaml is authoritative for terminal settings — overrides .env.
+
+    Runs at module import (matching the historical import-time contract that
+    tests pin) and again from start_gateway() after _load_runtime_env(), so
+    ${VAR} references into .env-defined values resolve exactly as they did
+    when the .env load itself happened at import time.
+    """
+    global _cfg
+    _config_path = _hermes_home / 'config.yaml'
+    if not _config_path.exists():
+        return
     try:
         import yaml as _yaml
         with open(_config_path, encoding="utf-8") as _f:
@@ -753,6 +778,9 @@ if _config_path.exists():
             "your current config.yaml. Run `hermes doctor` to investigate.",
             file=sys.stderr,
         )
+
+
+_bridge_config_to_env()
 
 # Apply IPv4 preference if configured (before any HTTP clients are created).
 try:
@@ -17748,8 +17776,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    # Load .env here — NOT at module import (importing gateway.run must not
+    # mutate os.environ; the pytest suite imports this module wholesale).
+    # Re-run the config bridge afterwards so ${VAR} references into
+    # .env-defined values and config-authority rules resolve the way they
+    # did when the .env load itself ran at import time.
+    _load_runtime_env()
+    _bridge_config_to_env()
+
     # ── Duplicate-instance guard ──────────────────────────────────────
-    # Prevent two gateways from running under the same HERMES_HOME.
     # The PID file is scoped to HERMES_HOME, so future multi-profile
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
