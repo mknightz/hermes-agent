@@ -30,6 +30,30 @@ class TestChatCompletionsBasic:
         result = transport.convert_messages(msgs)
         assert result is msgs  # no copy needed
 
+    def test_convert_messages_strips_name_on_tool_results_only(self, transport):
+        """``name`` is schema-foreign on tool results (strict providers such as
+        OpenCode Go's glm-5.3-flash upstream reject the payload with
+        '"name" is not supported by this endpoint'), so it is stripped there —
+        but preserved on user/assistant messages where it is schema-valid.
+        The input list is not mutated (copy-on-write contract)."""
+        msgs = [
+            {"role": "user", "content": "hi", "name": "mygel"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "execute_code", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok",
+             "name": "execute_code"},
+        ]
+        result = transport.convert_messages(msgs)
+        assert result[2] == {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+        # Schema-valid on non-tool roles — untouched.
+        assert result[0]["name"] == "mygel"
+        # Internal history is not mutated.
+        assert msgs[2]["name"] == "execute_code"
+        # A list with nothing to strip is returned by identity.
+        clean = [{"role": "user", "content": "hi", "name": "mygel"}]
+        assert transport.convert_messages(clean) is clean
+
     def test_convert_messages_strips_codex_fields(self, transport):
         msgs = [
             {"role": "assistant", "content": "ok", "codex_reasoning_items": [{"id": "rs_1"}],

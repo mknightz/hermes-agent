@@ -947,6 +947,14 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             agent._copy_reasoning_content_for_api(msg, api_msg)
             for internal_field in ("reasoning", "finish_reason", "_thinking_prefill"):
                 api_msg.pop(internal_field, None)
+            # ``name`` is schema-foreign on tool results (strict providers
+            # reject with '"name" is not supported by this endpoint'); it
+            # stays on user/assistant.  Mirror of the transport's
+            # role-qualified strip in ChatCompletionsTransport.convert_messages
+            # (upstream 693641aa8) — this path calls chat.completions.create()
+            # directly and bypasses the transport.
+            if api_msg.get("role") == "tool":
+                api_msg.pop("name", None)
             if _needs_sanitize:
                 agent._sanitize_tool_calls_for_strict_api(api_msg)
             api_messages.append(api_msg)

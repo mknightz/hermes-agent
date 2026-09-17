@@ -2463,6 +2463,34 @@ class TestHandleMaxIterations:
         ]
         assert len(orphan_ids) == 0, f"Orphan tool result still present: {orphan_ids}"
 
+    def test_summary_request_strips_name_from_tool_results(self, agent):
+        """The summary path calls chat.completions.create() directly, bypassing
+        the transport, so it must mirror the transport's role-qualified
+        ``name`` strip: tool results lose it, user messages keep it."""
+        resp = _mock_response(content="Summary")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff", "name": "mygel"},
+            {"role": "assistant",
+             "tool_calls": [{"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result",
+             "name": "terminal"},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        sent_msgs = kwargs.get("messages", [])
+        tool_msgs = [m for m in sent_msgs if m.get("role") == "tool" and m.get("tool_call_id") == "call_1"]
+        assert tool_msgs, "tool result missing from summary request"
+        assert all("name" not in m for m in tool_msgs), tool_msgs
+        sent_users = [m for m in sent_msgs if m.get("role") == "user"]
+        assert sent_users and sent_users[0].get("name") == "mygel"
+        # Internal history untouched.
+        assert messages[2]["name"] == "terminal"
+
     def test_summary_request_inserts_stub_for_missing_tool_result(self, agent):
         """If an assistant tool_call has no matching tool result in the
         summary request, a stub must be inserted to satisfy the API contract."""
