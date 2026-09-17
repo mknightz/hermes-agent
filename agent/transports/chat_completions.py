@@ -112,17 +112,32 @@ class ChatCompletionsTransport(ProviderTransport):
     def convert_messages(
         self, messages: list[dict[str, Any]], **kwargs
     ) -> list[dict[str, Any]]:
-        """Messages are already in OpenAI format — sanitize Codex leaks only.
+        """Messages are already in OpenAI format — sanitize strict-provider rejects.
 
-        Strips Codex Responses API fields (``codex_reasoning_items`` /
-        ``codex_message_items`` on the message, ``call_id``/``response_item_id``
-        on tool_calls) that strict chat-completions providers reject with 400/422.
+        Strips fields the Chat Completions schema does not carry that strict
+        providers reject with 400/422:
+
+        - Codex Responses API fields (``codex_reasoning_items`` /
+          ``codex_message_items`` on the message, ``call_id`` /
+          ``response_item_id`` on tool_calls).
+        - ``name`` on tool-result messages. The schema has no ``name`` on
+          ``role: tool`` (only on the long-removed ``role: function``), but
+          Hermes carries the tool name over onto the result message.
+          Permissive providers ignore it; strict ones reject the whole
+          payload — OpenCode Go (glm-5.3-flash upstream) started returning
+          ``[invalid_request_error] messages[N]: "name" is not supported by
+          this endpoint`` on 2026-09-16, failing every tool turn. The removal
+          is role-qualified: ``name`` stays on user/assistant messages, where
+          it is schema-valid. Backport of upstream 693641aa8.
         """
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
                 continue
             if "codex_reasoning_items" in msg or "codex_message_items" in msg:
+                needs_sanitize = True
+                break
+            if msg.get("role") == "tool" and "name" in msg:
                 needs_sanitize = True
                 break
             tool_calls = msg.get("tool_calls")
@@ -145,6 +160,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 continue
             msg.pop("codex_reasoning_items", None)
             msg.pop("codex_message_items", None)
+            if msg.get("role") == "tool":
+                msg.pop("name", None)
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 for tc in tool_calls:
