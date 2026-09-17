@@ -27,6 +27,7 @@ import os
 import re
 import smtplib
 import ssl
+import time
 import uuid
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -296,6 +297,29 @@ class EmailAdapter(BasePlatformAdapter):
         # small-team mailboxes).  Defaults off so replies stay To: sender only.
         self._reply_all = os.getenv("EMAIL_REPLY_ALL", "").strip().lower() in {"1", "true", "yes"}
 
+        # Repeat suppression: an identical (sender, subject) pair arriving
+        # inside this window is dropped before it can cost a model turn —
+        # the first occurrence dispatches immediately, repeats are logged
+        # only.  Mirrors the system-monitor alert throttle shape (first
+        # breach of an episode alerts, repeats suppressed 6h); the window
+        # is the recovery proxy because the mailbox cannot observe the
+        # monitored condition clearing.  Reply subjects ("Re: ...") are
+        # never suppressed — human threads must always reach the agent.
+        # "0" disables.  Added 2026-09-16 after 208 re-triaged monitor
+        # alerts in 30 days each cost an LLM turn and a reply email.
+        _repeat_hours = os.getenv("EMAIL_REPEAT_SUPPRESS_HOURS", "6").strip()
+        try:
+            _repeat_window = max(0.0, float(_repeat_hours)) * 3600.0
+        except ValueError:
+            logger.warning(
+                "[Email] Invalid EMAIL_REPEAT_SUPPRESS_HOURS=%r; using default 6h",
+                _repeat_hours,
+            )
+            _repeat_window = 6 * 3600.0
+        self._repeat_window = _repeat_window
+        self._repeat_max_keys = 1000
+        self._repeat_last_seen: Dict[Tuple[str, str], float] = {}
+
         # Skip attachments — configured via config.yaml:
         #   platforms:
         #     email:
@@ -333,6 +357,27 @@ class EmailAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    def _trim_repeat_last_seen(self) -> None:
+        """Prune the repeat-suppression map to prevent unbounded growth.
+
+        Expired stamps (outside the window) are always droppable — the
+        window is the recovery proxy, so an expired stamp means the
+        monitored condition is presumed recovered and the next arrival
+        dispatches again.  If the map is still oversized (clock skew,
+        pathological senders), keep the most recent half.
+        """
+        _now = time.time()
+        self._repeat_last_seen = {
+            key: stamp
+            for key, stamp in self._repeat_last_seen.items()
+            if (_now - stamp) < self._repeat_window
+        }
+        if len(self._repeat_last_seen) > self._repeat_max_keys:
+            _recent = sorted(
+                self._repeat_last_seen.items(), key=lambda kv: kv[1], reverse=True
+            )
+            self._repeat_last_seen = dict(_recent[: self._repeat_max_keys // 2])
 
     def _select_folder(self, imap) -> None:
         """Select the configured IMAP folder, failing loudly if unavailable.
@@ -534,7 +579,28 @@ class EmailAdapter(BasePlatformAdapter):
                 logger.debug("[Email] Dropping non-allowlisted sender at dispatch: %s", sender_addr)
                 return
 
+        # Repeat suppression (see __init__): drop re-arrival of the same
+        # (sender, subject) within the window before it reaches the model.
+        # Only non-reply subjects are considered — automated alert mail
+        # always arrives with a fresh subject, while humans thread with
+        # "Re:" and their follow-ups must always get through.
         subject = msg_data["subject"]
+        if self._repeat_window > 0 and subject and not subject.lower().startswith("re:"):
+            _now = time.time()
+            _repeat_key = (sender_addr.lower(), subject)
+            _last_seen = self._repeat_last_seen.get(_repeat_key)
+            if _last_seen is not None and (_now - _last_seen) < self._repeat_window:
+                logger.info(
+                    "[Email] Suppressing repeat from %s — same subject within %.1fh: %s",
+                    sender_addr,
+                    self._repeat_window / 3600.0,
+                    subject,
+                )
+                return
+            self._repeat_last_seen[_repeat_key] = _now
+            if len(self._repeat_last_seen) > self._repeat_max_keys:
+                self._trim_repeat_last_seen()
+
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
 

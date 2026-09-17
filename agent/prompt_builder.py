@@ -472,7 +472,14 @@ PLATFORM_HINTS = {
         "Keep responses concise but complete. You can send file attachments — "
         "include MEDIA:/absolute/path/to/file in your response. The subject line "
         "is preserved for threading. Do not include greetings or sign-offs unless "
-        "contextually appropriate."
+        "contextually appropriate. "
+        "Every reply you produce is sent as an email — you cannot remark without "
+        "emailing. When you judge that no reply is warranted (for example a repeat "
+        "of an automated alert you have already triaged, or any message that needs "
+        "no action and would only say so), make your entire response the directive "
+        "[[silent]] — the gateway then sends nothing and logs the verdict. Never "
+        "announce silence in prose: a reply like 'Silent.' or 'No action needed' "
+        "is itself a full email to the user."
     ),
     "cron": (
         "You are running as a scheduled cron job. There is no user present — you "

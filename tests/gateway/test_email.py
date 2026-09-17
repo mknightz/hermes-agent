@@ -1446,3 +1446,133 @@ class TestReplyAllCc(unittest.TestCase):
         call_args, _ = self._reply(adapter, "stranger@example.com")
         sent = call_args[0][0]
         self.assertIsNone(sent["Cc"])
+
+
+class TestRepeatSuppression(unittest.TestCase):
+    """Identical (sender, subject) pairs inside the window are dropped
+    before reaching the model — the token-saving half of the alert-noise
+    fix. First occurrence dispatches immediately; repeats are log-only.
+    """
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_IMAP_PORT": "993",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            "EMAIL_SMTP_PORT": "587",
+            "EMAIL_POLL_INTERVAL": "15",
+        }
+        if extra_env:
+            env.update(extra_env)
+        with patch.dict(os.environ, env, clear=False):
+            from gateway.platforms.email import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        dispatched = []
+
+        async def capture_handle(event):
+            dispatched.append(event)
+
+        adapter.handle_message = capture_handle
+        return adapter, dispatched
+
+    @staticmethod
+    def _msg(uid, sender="alerts@nodrizahb", subject="[nodrizahb] High Swap Usage"):
+        return {
+            "uid": uid,
+            "sender_addr": sender,
+            "sender_name": "Monitor",
+            "subject": subject,
+            "message_id": "<msg%s@test.com>" % uid,
+            "in_reply_to": "",
+            "body": "Swap usage is 100.0% (threshold: 95%)",
+            "attachments": [],
+            "date": "",
+        }
+
+    def test_default_window_is_six_hours(self):
+        adapter, _ = self._make_adapter()
+        self.assertEqual(adapter._repeat_window, 6 * 3600)
+
+    def test_invalid_hours_env_falls_back_to_six_hours(self):
+        adapter, _ = self._make_adapter({"EMAIL_REPEAT_SUPPRESS_HOURS": "banana"})
+        self.assertEqual(adapter._repeat_window, 6 * 3600)
+
+    def test_first_alert_dispatches(self):
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        self.assertEqual(len(dispatched), 1)
+
+    def test_repeat_within_window_suppressed(self):
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        asyncio.run(adapter._dispatch_message(self._msg(b"2")))
+        self.assertEqual(len(dispatched), 1)
+
+    def test_suppression_does_not_refresh_window(self):
+        """Window anchors at the last *dispatched* message, mirroring the
+        monitor-side throttle (stamp touched only when an alert is sent)."""
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        key = ("alerts@nodrizahb", "[nodrizahb] High Swap Usage")
+        first_stamp = adapter._repeat_last_seen[key]
+        asyncio.run(adapter._dispatch_message(self._msg(b"2")))
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(adapter._repeat_last_seen[key], first_stamp)
+
+    def test_different_subject_dispatches(self):
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1", subject="[nodrizahb] High Swap Usage")))
+        asyncio.run(adapter._dispatch_message(self._msg(b"2", subject="[nodrizahb] High Memory Usage")))
+        self.assertEqual(len(dispatched), 2)
+
+    def test_different_sender_dispatches(self):
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1", sender="alerts@nodrizahb")))
+        asyncio.run(adapter._dispatch_message(self._msg(b"2", sender="alerts@beelink")))
+        self.assertEqual(len(dispatched), 2)
+
+    def test_reply_subjects_never_suppressed(self):
+        """Human thread follow-ups ("Re: ...") must always reach the agent,
+        even when an automated alert used the same base subject."""
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        asyncio.run(adapter._dispatch_message(
+            self._msg(b"2", sender="user@test.com", subject="Re: [nodrizahb] High Swap Usage")))
+        asyncio.run(adapter._dispatch_message(
+            self._msg(b"3", sender="user@test.com", subject="Re: [nodrizahb] High Swap Usage")))
+        self.assertEqual(len(dispatched), 3)
+
+    def test_expired_window_dispatches_again(self):
+        import time as _time
+        import asyncio
+        adapter, dispatched = self._make_adapter()
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        key = ("alerts@nodrizahb", "[nodrizahb] High Swap Usage")
+        adapter._repeat_last_seen[key] = _time.time() - adapter._repeat_window - 1
+        asyncio.run(adapter._dispatch_message(self._msg(b"2")))
+        self.assertEqual(len(dispatched), 2)
+
+    def test_zero_hours_disables_suppression(self):
+        import asyncio
+        adapter, dispatched = self._make_adapter({"EMAIL_REPEAT_SUPPRESS_HOURS": "0"})
+        self.assertEqual(adapter._repeat_window, 0)
+        asyncio.run(adapter._dispatch_message(self._msg(b"1")))
+        asyncio.run(adapter._dispatch_message(self._msg(b"2")))
+        self.assertEqual(len(dispatched), 2)
+
+    def test_trim_removes_expired_stamps(self):
+        import time as _time
+        adapter, _ = self._make_adapter()
+        key = ("alerts@nodrizahb", "[nodrizahb] High Swap Usage")
+        adapter._repeat_last_seen[key] = _time.time() - adapter._repeat_window - 1
+        adapter._trim_repeat_last_seen()
+        self.assertNotIn(key, adapter._repeat_last_seen)
