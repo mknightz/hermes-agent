@@ -1,6 +1,8 @@
 """Tests for the BlueBubbles iMessage gateway adapter."""
 import asyncio
 import json
+import os
+import shutil
 from unittest.mock import AsyncMock
 
 import httpx
@@ -310,6 +312,226 @@ class TestBlueBubblesAttachmentSend:
             "application/octet-stream",
         )
         assert captured["data"]["chatGuid"] == "iMessage;+;chat-guid"
+
+
+class _FakeFfmpegProc:
+    """Stand-in for an asyncio subprocess running ffmpeg."""
+
+    def __init__(self, returncode=0, out_path=None, out_bytes=b"caff\x00\x01fake", hang=False):
+        self.returncode = None
+        self._rc = returncode
+        self._out_path = out_path
+        self._out_bytes = out_bytes
+        self._hang = hang
+        self.killed = False
+
+    async def communicate(self):
+        if self._hang:
+            await asyncio.sleep(3600)
+        if self._out_path is not None and self._out_bytes is not None:
+            with open(self._out_path, "wb") as fh:
+                fh.write(self._out_bytes)
+        self.returncode = self._rc
+        return b"", b"ffmpeg stderr"
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+class TestBlueBubblesVoiceCafConversion:
+    """Outbound voice notes must be CAF: IMCore shows a non-CAF isAudioMessage as a 0s memo."""
+
+    @pytest.fixture
+    def setup(self, monkeypatch, tmp_path):
+        import gateway.platforms.bluebubbles as bb
+
+        adapter = _make_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;+;chat-guid"
+
+        class MockResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"status": 200, "data": {"guid": "message-guid"}}
+
+        class MockClient:
+            async def post(self, url, *, files, data, timeout):
+                captured.update(url=url, files=files, data=data, timeout=timeout)
+                return MockResponse()
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        adapter.client = MockClient()
+
+        work_dir = tmp_path / "caf-work"
+        monkeypatch.setattr(bb.tempfile, "mkdtemp", lambda *a, **k: (work_dir.mkdir(), str(work_dir))[1])
+
+        calls = []
+        state = {"proc": None, "exc": None, "rc": 0, "out_bytes": b"caff\x00\x01fake", "hang": False}
+
+        async def fake_exec(*args, **kwargs):
+            calls.append(args)
+            if state["exc"] is not None:
+                raise state["exc"]
+            proc = _FakeFfmpegProc(returncode=state["rc"], out_path=args[-1],
+                                   out_bytes=state["out_bytes"], hang=state["hang"])
+            state["proc"] = proc
+            return proc
+
+        monkeypatch.setattr(bb.asyncio, "create_subprocess_exec", fake_exec)
+        src = tmp_path / "reply.mp3"
+        src.write_bytes(b"ID3-mp3-bytes")
+        return dict(bb=bb, adapter=adapter, captured=captured, calls=calls, state=state,
+                    src=src, work_dir=work_dir, tmp_path=tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_non_caf_audio_message_is_converted_with_libopus(self, setup):
+        result = await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert result.success is True
+        assert len(setup["calls"]) == 1
+        argv = setup["calls"][0]
+        assert argv[0] == "ffmpeg"
+        assert str(setup["src"]) in argv
+        assert argv[argv.index("-c:a") + 1] == "libopus"
+        assert argv[argv.index("-ar") + 1] == "48000"
+        assert argv[argv.index("-ac") + 1] == "1"
+        out = argv[-1]
+        assert out.endswith(".caf")
+        # Output goes to a private temp dir, never next to the source file.
+        assert os.path.dirname(out) == str(setup["work_dir"])
+        assert setup["captured"]["data"]["isAudioMessage"] == "true"
+
+    @pytest.mark.asyncio
+    async def test_converted_voice_uses_caf_mime_and_filename(self, setup):
+        await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        name, payload, mime = setup["captured"]["files"]["attachment"]
+        assert name == "Voice Message.caf"
+        assert mime == "audio/x-caf"
+        assert payload == b"caff\x00\x01fake"
+        assert setup["captured"]["data"]["name"] == "Voice Message.caf"
+
+    @pytest.mark.asyncio
+    async def test_caf_input_passes_through_unconverted(self, setup):
+        caf = setup["tmp_path"] / "already.caf"
+        caf.write_bytes(b"caff-original")
+
+        result = await setup["adapter"].send_voice("target", str(caf))
+
+        assert result.success is True
+        assert setup["calls"] == []
+        name, payload, mime = setup["captured"]["files"]["attachment"]
+        assert (name, payload, mime) == ("already.caf", b"caff-original", "audio/x-caf")
+
+    @pytest.mark.asyncio
+    async def test_non_audio_attachment_untouched(self, setup):
+        doc = setup["tmp_path"] / "notes.mp3"
+        doc.write_bytes(b"plain-document")
+
+        await setup["adapter"].send_document("target", str(doc))
+
+        assert setup["calls"] == []
+        assert setup["captured"]["files"]["attachment"] == (
+            "notes.mp3", b"plain-document", "application/octet-stream")
+        assert "isAudioMessage" not in setup["captured"]["data"]
+
+    @pytest.mark.asyncio
+    async def test_ffmpeg_nonzero_exit_falls_back_to_original(self, setup):
+        # Non-zero exit must win even if ffmpeg left a non-empty (partial) file behind.
+        setup["state"]["rc"] = 1
+
+        result = await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert result.success is True
+        assert setup["captured"]["files"]["attachment"] == (
+            "reply.mp3", b"ID3-mp3-bytes", "application/octet-stream")
+        assert not setup["work_dir"].exists()
+
+    @pytest.mark.asyncio
+    async def test_ffmpeg_empty_output_falls_back_to_original(self, setup):
+        setup["state"]["out_bytes"] = b""
+
+        await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert setup["captured"]["files"]["attachment"][0] == "reply.mp3"
+        assert not setup["work_dir"].exists()
+
+    @pytest.mark.asyncio
+    async def test_ffmpeg_missing_falls_back_and_warns_once(self, setup, caplog):
+        setup["state"]["exc"] = FileNotFoundError("ffmpeg")
+        adapter = setup["adapter"]
+
+        with caplog.at_level("WARNING", logger="gateway.platforms.bluebubbles"):
+            await adapter.send_voice("target", str(setup["src"]))
+            first = setup["captured"]["files"]["attachment"]
+            await adapter.send_voice("target", str(setup["src"]))
+
+        assert first == ("reply.mp3", b"ID3-mp3-bytes", "application/octet-stream")
+        assert setup["captured"]["files"]["attachment"] == first
+        warnings = [r for r in caplog.records if "ffmpeg" in r.getMessage().lower()]
+        assert len(warnings) == 1
+        assert not setup["work_dir"].exists()
+
+    @pytest.mark.asyncio
+    async def test_ffmpeg_timeout_kills_process_and_falls_back(self, setup, monkeypatch):
+        monkeypatch.setattr(setup["bb"], "_CAF_CONVERT_TIMEOUT_SECONDS", 0.05)
+        setup["state"]["hang"] = True
+
+        result = await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert result.success is True
+        assert setup["state"]["proc"].killed is True
+        assert setup["captured"]["files"]["attachment"][0] == "reply.mp3"
+        assert not setup["work_dir"].exists()
+
+    @pytest.mark.asyncio
+    async def test_temp_caf_removed_after_successful_send(self, setup):
+        await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert not setup["work_dir"].exists()
+        assert setup["src"].exists()  # the caller's file is never deleted
+
+    @pytest.mark.asyncio
+    async def test_temp_caf_removed_when_upload_raises(self, setup):
+        class BoomClient:
+            async def post(self, *a, **k):
+                raise httpx.ConnectError("down")
+
+        setup["adapter"].client = BoomClient()
+
+        result = await setup["adapter"].send_voice("target", str(setup["src"]))
+
+        assert result.success is False
+        assert not setup["work_dir"].exists()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+@pytest.mark.asyncio
+async def test_real_ffmpeg_mp3_to_caf(tmp_path, monkeypatch):
+    import subprocess
+
+    src = tmp_path / "tone.mp3"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                    str(src)], check=True, stdin=subprocess.DEVNULL, timeout=60)
+    adapter = _make_adapter(monkeypatch)
+
+    converted = await adapter._convert_to_caf(str(src))
+
+    assert converted is not None
+    work_dir, caf_path = converted
+    try:
+        with open(caf_path, "rb") as fh:
+            assert fh.read(4) == b"caff"
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import uuid
 from collections import OrderedDict
 from contextlib import suppress
@@ -40,6 +42,8 @@ _BLUEBUBBLES_AUDIO_EXT_OVERRIDES = {
 }
 
 logger = logging.getLogger(__name__)
+# ffmpeg bound for the outbound voice-note CAF transcode; on timeout the process is killed.
+_CAF_CONVERT_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 # Webhook events are small JSON/form payloads (attachments come through the REST API); 1 MiB keeps
@@ -107,6 +111,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     serves_profile_prefix: bool = True
     platform = Platform.BLUEBUBBLES
     SUPPORTS_MESSAGE_EDITING = False
+    _warned_no_ffmpeg = False  # missing-ffmpeg hint is logged once per adapter, not per voice note
     MAX_MESSAGE_LENGTH = MAX_TEXT_LENGTH
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
@@ -395,6 +400,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not guid:
             return SendResult(success=False, error=f"Chat not found: {chat_id}")
         fname = filename or os.path.basename(file_path)
+        work_dir: Optional[str] = None
+        # IMCore only plays isAudioMessage attachments that are CAF; anything else (e.g. TTS MP3)
+        # shows as an unplayable 0-second voice memo (BlueBubbles #773). Fall back to the original.
+        if is_audio_message and not file_path.lower().endswith(".caf"):
+            if converted := await self._convert_to_caf(file_path):
+                work_dir, file_path = converted
+                fname = "Voice Message.caf"
+        mime = "audio/x-caf" if is_audio_message and fname.lower().endswith(".caf") else "application/octet-stream"
         try:
             # httpx's async multipart iterator reads file objects through a sync chunk generator —
             # read the bytes off the event-loop thread first.
@@ -403,7 +416,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             if is_audio_message:
                 data["isAudioMessage"] = "true"
             res = await self.client.post(self._api_url("/api/v1/message/attachment"), data=data, timeout=120,
-                                         files={"attachment": (fname, payload, "application/octet-stream")})
+                                         files={"attachment": (fname, payload, mime)})
             res.raise_for_status()
             result = res.json()
             if caption:
@@ -415,6 +428,45 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=result.get("message", "Attachment upload failed"))
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        finally:
+            if work_dir:
+                await asyncio.to_thread(shutil.rmtree, work_dir, True)
+
+    async def _convert_to_caf(self, src_path: str) -> Optional[tuple]:
+        """Transcode audio to mono 48 kHz Opus-in-CAF for iMessage voice notes. Returns
+        ``(work_dir, caf_path)`` — the caller removes ``work_dir`` — or None on any failure
+        (ffmpeg missing, non-zero exit, empty output, timeout), with ``work_dir`` already removed."""
+        work_dir = await asyncio.to_thread(tempfile.mkdtemp, prefix="hermes-bb-caf-")
+        caf_path = os.path.join(work_dir, "voice.caf")
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", src_path, "-vn",
+                "-c:a", "libopus", "-ar", "48000", "-ac", "1", caf_path,
+                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE)
+            _, stderr = await asyncio.wait_for(proc.communicate(), _CAF_CONVERT_TIMEOUT_SECONDS)
+            if proc.returncode == 0 and await asyncio.to_thread(
+                    lambda: os.path.isfile(caf_path) and os.path.getsize(caf_path) > 0):
+                return work_dir, caf_path
+            logger.warning("[bluebubbles] ffmpeg CAF transcode of %s failed (returncode=%s): %s — sending original",
+                           src_path, proc.returncode, (stderr or b"").decode("utf-8", errors="replace")[:500])
+        except FileNotFoundError:
+            if not self._warned_no_ffmpeg:
+                self._warned_no_ffmpeg = True
+                logger.warning("[bluebubbles] ffmpeg not found on PATH — voice notes are sent unconverted and "
+                               "iMessage may show them as 0-second memos. Install ffmpeg (with libopus) to fix.")
+        except asyncio.TimeoutError:
+            logger.warning("[bluebubbles] ffmpeg CAF transcode of %s timed out after %ss — sending original",
+                           src_path, _CAF_CONVERT_TIMEOUT_SECONDS)
+            with suppress(ProcessLookupError):
+                proc.kill()
+            with suppress(Exception):
+                await proc.wait()
+        except Exception:
+            logger.warning("[bluebubbles] CAF transcode of %s failed — sending original", src_path, exc_info=True)
+        await asyncio.to_thread(shutil.rmtree, work_dir, True)
+        return None
 
     async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
