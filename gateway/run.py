@@ -1785,26 +1785,36 @@ class GatewayRunner:
             enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
             if isinstance(enabled_chats, set):
                 enabled_chats.discard(chat_id)
+            all_chats = getattr(adapter, "_auto_tts_all_chats", None)
+            if isinstance(all_chats, set):
+                all_chats.discard(chat_id)
         else:
             disabled_chats.discard(chat_id)
 
-    def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool) -> None:
+    def _set_adapter_auto_tts_enabled(self, adapter, chat_id: str, enabled: bool, mode: str = "voice_only") -> None:
         """Update an adapter's per-chat auto-TTS opt-in set if present.
 
         Used for ``/voice on``/``/voice tts`` where the user explicitly wants
         auto-TTS even when ``voice.auto_tts`` is False globally.
         """
         enabled_chats = getattr(adapter, "_auto_tts_enabled_chats", None)
-        if not isinstance(enabled_chats, set):
-            return
+        all_chats = getattr(adapter, "_auto_tts_all_chats", None)
+        disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
+        if isinstance(disabled_chats, set):
+            disabled_chats.discard(chat_id)
         if enabled:
-            enabled_chats.add(chat_id)
-            # An explicit opt-in clears any stale /voice off for this chat.
-            disabled_chats = getattr(adapter, "_auto_tts_disabled_chats", None)
-            if isinstance(disabled_chats, set):
-                disabled_chats.discard(chat_id)
+            if isinstance(enabled_chats, set):
+                enabled_chats.add(chat_id)
+            if isinstance(all_chats, set):
+                if mode == "all":
+                    all_chats.add(chat_id)
+                else:
+                    all_chats.discard(chat_id)
         else:
-            enabled_chats.discard(chat_id)
+            if isinstance(enabled_chats, set):
+                enabled_chats.discard(chat_id)
+            if isinstance(all_chats, set):
+                all_chats.discard(chat_id)
 
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
@@ -1837,6 +1847,7 @@ class GatewayRunner:
             adapter._auto_tts_default = _auto_tts_default
 
         prefix = f"{platform.value}:"
+        all_chats = getattr(adapter, "_auto_tts_all_chats", None)
         if isinstance(disabled_chats, set):
             disabled_chats.clear()
             disabled_chats.update(
@@ -1848,6 +1859,12 @@ class GatewayRunner:
             enabled_chats.update(
                 key[len(prefix):] for key, mode in self._voice_mode.items()
                 if mode in {"voice_only", "all"} and key.startswith(prefix)
+            )
+        if isinstance(all_chats, set):
+            all_chats.clear()
+            all_chats.update(
+                key[len(prefix):] for key, mode in self._voice_mode.items()
+                if mode == "all" and key.startswith(prefix)
             )
 
     async def _safe_adapter_disconnect(self, adapter, platform) -> None:
@@ -10797,7 +10814,7 @@ class GatewayRunner:
             self._voice_mode[voice_key] = "voice_only"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True, mode="voice_only")
             return t("gateway.voice.enabled_voice_only")
         elif args in {"off", "disable"}:
             self._voice_mode[voice_key] = "off"
@@ -10809,7 +10826,7 @@ class GatewayRunner:
             self._voice_mode[voice_key] = "all"
             self._save_voice_modes()
             if adapter:
-                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+                self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True, mode="all")
             return t("gateway.voice.tts_enabled")
         elif args in {"channel", "join"}:
             return await self._handle_voice_channel_join(event)

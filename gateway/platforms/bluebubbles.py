@@ -486,9 +486,29 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Chat not found: {chat_id}")
 
         fname = filename or os.path.basename(file_path)
+        cleanup_caf = None
+        if is_audio_message and not file_path.lower().endswith(".caf"):
+            caf_path = os.path.splitext(file_path)[0] + ".caf"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-y", "-i", file_path,
+                    "-c:a", "libopus", "-ar", "48000", "-ac", "1",
+                    caf_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                if os.path.isfile(caf_path) and os.path.getsize(caf_path) > 0:
+                    file_path = caf_path
+                    fname = "Voice Message.caf"
+                    cleanup_caf = caf_path
+            except Exception as conv_err:
+                logger.warning("[bluebubbles] failed to convert audio to CAF: %s", conv_err)
+
+        mime_type = "audio/x-caf" if fname.lower().endswith(".caf") else "application/octet-stream"
         try:
             with open(file_path, "rb") as f:
-                files = {"attachment": (fname, f, "application/octet-stream")}
+                files = {"attachment": (fname, f, mime_type)}
                 data: Dict[str, str] = {
                     "chatGuid": guid,
                     "name": fname,
@@ -520,6 +540,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
+        finally:
+            if cleanup_caf and os.path.exists(cleanup_caf):
+                try:
+                    os.unlink(cleanup_caf)
+                except OSError:
+                    pass
 
     async def send_image(
         self,

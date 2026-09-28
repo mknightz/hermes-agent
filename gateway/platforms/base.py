@@ -1372,6 +1372,7 @@ class BasePlatformAdapter(ABC):
         #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
         self._auto_tts_default: bool = False
         self._auto_tts_enabled_chats: set = set()
+        self._auto_tts_all_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
@@ -3228,7 +3229,7 @@ class BasePlatformAdapter(ABC):
                 # True globally and no ``/voice off`` has been issued.
                 _tts_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
-                        and event.message_type == MessageType.VOICE
+                        and (event.message_type == MessageType.VOICE or event.source.chat_id in getattr(self, "_auto_tts_all_chats", set()))
                         and text_content
                         and not media_files):
                     try:
