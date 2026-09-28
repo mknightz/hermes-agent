@@ -123,3 +123,44 @@ class TestStreamedSilenceSuppression:
         assert consumer.already_sent is False
 
 
+
+
+# --------------------------------------------------------------------------
+# [[silent]] directive — a streamed verdict of silence is never shown
+# --------------------------------------------------------------------------
+
+class TestStreamedSilentDirective:
+    @pytest.mark.asyncio
+    async def test_bare_directive_stream_is_retracted_for_the_adapter(self):
+        """A bare [[silent]] stream shows nothing and leaves delivery flags False,
+        so the final response reaches the adapter's delivery seam, which drops it."""
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        for delta in ("[[", "sil", "ent", "]]"):
+            consumer.on_delta(delta)
+        consumer.finish()
+        await consumer.run()
+
+        for text in _sent_and_edited(adapter):
+            assert "[[" not in text and "silent" not in text, f"directive leaked: {text!r}"
+        assert consumer.final_response_sent is False
+        assert consumer.already_sent is False
+
+    @pytest.mark.asyncio
+    async def test_directive_alongside_text_streams_text_without_marker(self):
+        adapter = _make_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_1",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=1),
+        )
+        consumer.on_delta("Load is 17.1 — Immich ML grinding. [[silent]]")
+        consumer.finish()
+        await consumer.run()
+
+        texts = _sent_and_edited(adapter)
+        assert any("Immich ML" in t for t in texts)
+        for text in texts:
+            assert "[[silent]]" not in text, f"directive leaked: {text!r}"

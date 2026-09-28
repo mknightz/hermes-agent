@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
-from gateway.platforms.base import _custom_unit_to_cp
+from gateway.platforms.base import SILENT_DIRECTIVE, SILENT_DIRECTIVE_RE, _custom_unit_to_cp, unwrap_silent_directive
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -567,7 +567,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     # A bare intentional-silence marker (NO_REPLY / [SILENT]): the
                     # gateway's whole-response filter runs too late for a streamed
                     # preview, so retract it here instead of finalizing.
-                    if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
+                    # A bare [[silent]] directive retracts the same way; the adapter drops it.
+                    if (_is_intentional_silence_response(self._clean_for_display(self._accumulated))
+                            or unwrap_silent_directive(self._accumulated.strip())[1]):
                         await self._suppress_silence_marker()
                         return
 
@@ -744,8 +746,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                                    and not self._flood_strikes))
         # Defer mid-stream edits while the buffer could still resolve to a silence
         # marker ("NO"→"NO_REPLY"); got_done always resolves the buffer.
+        # Same for a (possibly complete) bare [[silent]] directive.
+        _held = self._accumulated.strip().lower()
         return should_edit and not _is_partial_silence_marker(
-            self._clean_for_display(self._accumulated))
+            self._clean_for_display(self._accumulated)) and not (
+            _held and SILENT_DIRECTIVE.startswith(_held))
 
     async def _split_first_send(self, tick: "_Tick") -> bool:
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
@@ -967,8 +972,12 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
     def _clean_for_display(text: str) -> str:
-        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream.
+        A [[silent]] marker is hidden too (the adapter strips it from the final reply)."""
+        text = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        if text and SILENT_DIRECTIVE in text.lower():
+            text = SILENT_DIRECTIVE_RE.sub("", text).strip()
+        return text
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

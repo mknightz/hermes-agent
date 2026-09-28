@@ -510,6 +510,28 @@ def safe_url_for_log(url: str, max_len: int = 80) -> str:
     return "." * max_len if max_len <= 3 else f"{safe[:max_len - 3]}..."
 
 
+# Always-honored "verdict of silence" directive. Distinct from the response_filters silence
+# markers ([SILENT] / NO_REPLY), which a human turn rejects with a visible fallback: those mean
+# "I have nothing to say", this means "I judged that no reply is warranted".
+SILENT_DIRECTIVE = "[[silent]]"
+SILENT_DIRECTIVE_RE = re.compile(r"\[\[silent\]\]", re.IGNORECASE)
+
+
+def unwrap_silent_directive(response):
+    """Apply the ``[[silent]]`` directive to a final response -> ``(response, silent_verdict)``.
+
+    The bare marker (case/whitespace-insensitive) sends nothing — the caller logs the verdict
+    instead of delivering it (e.g. "Same band, no material change. Silent." as an email). Any
+    other text alongside the marker is delivered with the marker stripped, so a substantive
+    reply can never be swallowed by a stray marker."""
+    if not response or SILENT_DIRECTIVE not in response.lower():
+        return response, False
+    without_marker = SILENT_DIRECTIVE_RE.sub("", response).strip()
+    if without_marker:
+        return without_marker, False
+    return None, True
+
+
 async def _ssrf_redirect_guard(response):
     """Re-validate each redirect target (a public URL 302-ing to http://169.254.169.254/ would
     bypass the pre-flight is_safe_url()). Async because httpx awaits response event hooks."""
@@ -4461,6 +4483,11 @@ class BasePlatformAdapter(ABC):
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+            # Bare [[silent]]: the agent judged no reply warranted — log the verdict, send nothing.
+            response, _silent_verdict = unwrap_silent_directive(response)
+            if _silent_verdict:
+                logger.info("[%s] Silent verdict — sending no reply to %s (agent judged none warranted)",
+                            self.name, event.source.chat_id)
             # None/empty is normal (streamed/queued). Suppress a stale response after an interrupt.
             if response and interrupt_event.is_set() and session_key in self._pending_messages:
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
