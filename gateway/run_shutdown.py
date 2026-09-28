@@ -1818,10 +1818,9 @@ class GatewayShutdownMixin:
             self._active_cron_job_count(), _api_at_start, self._active_api_run_count(),
             _deferred_at_start, ctx.deferred_count(),
         )
-        if ctx.timed_out:
-            return
-        # Graceful drain: clear the pre-drain resume_pending markers so sessions that finished
-        # during the drain window don't carry a stale flag.
+        # Clear the pre-drain resume_pending markers of sessions that finished during the drain window
+        # so they don't carry a stale flag — timed-out drains included (still-running sessions keep
+        # their marker and are re-marked by _stop_interrupt_remaining_work).
         for _sk in _pre_drain_keys:
             if _sk not in self._running_agents:
                 try:
