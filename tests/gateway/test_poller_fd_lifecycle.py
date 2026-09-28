@@ -78,6 +78,7 @@ class TestFetchClosesSocketOnBrokenLogout(unittest.TestCase):
     def test_fetch_logout_abort_falls_back_to_shutdown(self):
         adapter = _make_email_adapter()
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         mock_imap.uid.return_value = ("OK", [b""])
         mock_imap.logout.side_effect = imaplib.IMAP4.abort("EOF")
 

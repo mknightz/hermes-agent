@@ -346,6 +346,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._from_address = setting("EMAIL_FROM_ADDRESS", "from_address").strip() or self._address
         self._password = _get_secret("EMAIL_PASSWORD", "")
         self._imap_host = setting("EMAIL_IMAP_HOST", "imap_host").strip()
+        # Folder to poll instead of INBOX (e.g. a server-side rule routes this agent's mail on a shared mailbox).
+        self._imap_folder = setting("EMAIL_IMAP_FOLDER", "imap_folder").strip() or "INBOX"
         self._imap_port = _esecret_int("EMAIL_IMAP_PORT", 993)
         self._imap_security = _normalize_security(setting("EMAIL_IMAP_SECURITY", "imap_security"))
         self._imap_tls_verify = tls_verify("EMAIL_IMAP_TLS_VERIFY", "imap_tls_verify")
@@ -397,9 +399,17 @@ class EmailAdapter(BasePlatformAdapter):
                 raise
         return imap
 
+    def _select_folder(self, imap: imaplib.IMAP4) -> None:
+        """Select the configured folder (RFC 3501-quoted so spaces work); raise if unselectable, so a missing or
+        renamed folder fails the connect instead of leaving a poller silently watching nothing."""
+        status, data = imap.select('"%s"' % self._imap_folder.replace("\\", "\\\\").replace('"', '\\"'))
+        if status != "OK":
+            detail = data[0].decode(errors="replace") if data and isinstance(data[0], bytes) else data
+            raise RuntimeError(f"IMAP folder {self._imap_folder!r} not selectable: {detail}")
+
     @contextmanager
     def _inbox(self):
-        """Logged-in IMAP handle on INBOX; always ``_close_imap``-ed on exit (a login/select failure used to leak one fd per reconnect)."""
+        """Logged-in IMAP handle on the configured folder (default INBOX); always ``_close_imap``-ed on exit (a login/select failure used to leak one fd per reconnect)."""
         # Test IMAP connection. The handle is closed in ``finally`` — before this, a failure in
         # login/select/search left the TCP socket open with no owner, leaking one fd per connect attempt.
         # Under the gateway's reconnect watcher (fresh adapter instance per retry) against an
@@ -409,7 +419,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             imap.login(self._address, self._password)
             _send_imap_id(imap)
-            imap.select("INBOX")
+            self._select_folder(imap)
             yield imap
         finally:
             _close_imap(imap)

@@ -556,6 +556,7 @@ class TestConnectDisconnect(unittest.TestCase):
         adapter = self._make_adapter()
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         mock_imap.uid.return_value = ("OK", [b"1 2 3"])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
@@ -601,6 +602,7 @@ class TestFetchNewMessages(unittest.TestCase):
         raw_email["Message-ID"] = "<msg@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -653,6 +655,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<inbox@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -717,6 +720,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<batch1@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         fetches = []
 
         def uid_handler(command, *args):
@@ -753,6 +757,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<ok@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         fetches = []
 
         def uid_handler(command, *args):
@@ -788,6 +793,7 @@ class TestPollLoop(unittest.TestCase):
         good_email["Message-ID"] = "<good@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -839,6 +845,7 @@ class TestReconnectSeenUidsRestore(unittest.TestCase):
         import asyncio
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -1363,6 +1370,81 @@ class TestFromAddressAlias(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertEqual(mock_server.send_message.call_args[0][0]["From"], "agent@alias.test")
         mock_server.login.assert_called_once_with("hermes@test.com", "secret")
+
+
+class TestImapFolderSelection(unittest.TestCase):
+    """Test EMAIL_IMAP_FOLDER support (default INBOX, quoted select, fail-loud)."""
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }
+        env.update(extra_env or {})
+        with patch.dict(os.environ, env):
+            if "EMAIL_IMAP_FOLDER" not in env:
+                os.environ.pop("EMAIL_IMAP_FOLDER", None)
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def test_default_folder_is_inbox(self):
+        """Without EMAIL_IMAP_FOLDER the adapter behaves exactly as before."""
+        adapter = self._make_adapter()
+        self.assertEqual(adapter._imap_folder, "INBOX")
+
+    def test_folder_from_env(self):
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": "Budget"})
+        self.assertEqual(adapter._imap_folder, "Budget")
+
+    def test_select_folder_quotes_name(self):
+        """Folder names are quoted per RFC 3501 so spaces work."""
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": "Budget Stuff"})
+        imap = MagicMock()
+        imap.select.return_value = ("OK", [b"7"])
+        adapter._select_folder(imap)
+        imap.select.assert_called_once_with('"Budget Stuff"')
+
+    def test_select_folder_escapes_quotes_and_backslashes(self):
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": 'A "b" \\c'})
+        imap = MagicMock()
+        imap.select.return_value = ("OK", [b"7"])
+        adapter._select_folder(imap)
+        imap.select.assert_called_once_with('"A \\"b\\" \\\\c"')
+
+    def test_select_folder_fails_loud(self):
+        """A missing folder must raise, not silently poll nothing."""
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": "Missing"})
+        imap = MagicMock()
+        imap.select.return_value = ("NO", [b"[NONEXISTENT] Unknown Mailbox"])
+        with self.assertRaises(RuntimeError) as ctx:
+            adapter._select_folder(imap)
+        self.assertIn("Missing", str(ctx.exception))
+
+    def test_fetch_polls_configured_folder(self):
+        """The poll path selects the configured folder, not a hardcoded INBOX."""
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": "Budget"})
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"0"])
+        mock_imap.uid.return_value = ("OK", [b""])
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            adapter._fetch_new_messages()
+        mock_imap.select.assert_called_once_with('"Budget"')
+
+    def test_connect_fails_when_folder_missing(self):
+        """connect() surfaces an unselectable folder as a fatal error and closes the socket."""
+        import asyncio
+        adapter = self._make_adapter({"EMAIL_IMAP_FOLDER": "Missing"})
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("NO", [b"Unknown Mailbox"])
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch("smtplib.SMTP"):
+            self.assertFalse(asyncio.run(adapter.connect()))
+        self.assertEqual(adapter.fatal_error_code, "email_imap_connect_error")
+        self.assertIn("Missing", adapter.fatal_error_message)
+        mock_imap.logout.assert_called_once()
 
 
 if __name__ == "__main__":
