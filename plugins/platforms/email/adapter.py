@@ -16,10 +16,10 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, getaddresses
 from email import encoders
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from gateway.platforms.base import (
     BasePlatformAdapter, SendResult,
@@ -247,6 +247,17 @@ def _extract_email_address(raw: str) -> str:
     return (match.group(1) if match else raw).strip().lower()
 
 
+def _collect_participants(msg: email_lib.message.Message, sender_addr: str, own_addresses: Iterable[str]) -> List[str]:
+    """Other human recipients of an inbound email: To + Cc, lowercased and deduped in order, minus the sender and
+    the agent's own identities (so a reply-all never Cc's us or the person already on the To: line)."""
+    excluded = {a.strip().lower() for a in own_addresses if a} | {sender_addr.strip().lower()}
+    participants: List[str] = []
+    for _name, addr in getaddresses(msg.get_all("To", []) + msg.get_all("Cc", [])):
+        if (addr := addr.strip().lower()) and addr not in excluded and addr not in participants:
+            participants.append(addr)
+    return participants
+
+
 def _domain_of(address: str) -> str:
     """Lowercased domain part of an email address, or ''."""
     return address.rpartition("@")[2].strip().lower()
@@ -356,6 +367,8 @@ class EmailAdapter(BasePlatformAdapter):
         self._smtp_security = _normalize_security(setting("EMAIL_SMTP_SECURITY", "smtp_security"), default="tls" if self._smtp_port == 465 else "starttls")
         self._smtp_tls_verify = tls_verify("EMAIL_SMTP_TLS_VERIFY", "smtp_tls_verify")
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
+        # Opt-in reply-all: Cc the inbound thread's other participants (shared household / small-team mailboxes).
+        self._reply_all = _esecret_bool("EMAIL_REPLY_ALL", is_truthy_value(extra.get("reply_all"), default=False))
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
         # (GHSA-rxqh-5572-8m77). Default ON; opt out via require_authenticated_sender: false / EMAIL_TRUST_FROM_HEADER=true.
@@ -369,10 +382,10 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_max: int = 2000   # cap to prevent unbounded memory growth
         self._poll_task: Optional[asyncio.Task] = None
         self._last_fetch_failed, self._last_fetch_error = False, ""  # "checked, nothing new" vs "the check itself failed"
-        # chat_id (sender email) -> last subject + message-id for threading
+        # chat_id (sender email) -> last subject + message-id for threading (+ other participants for reply-all)
         # Track the last IMAP fetch attempt so the poll loop can distinguish "checked, nothing new" from
         # "the check itself failed" (#80016).
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
         logger.info("[Email] Adapter initialized for %s", self._address)
 
     def _trim_seen_uids(self) -> None:
@@ -594,6 +607,7 @@ class EmailAdapter(BasePlatformAdapter):
                 "message_id": msg.get("Message-ID", ""), "in_reply_to": msg.get("In-Reply-To", ""),
                 "body": _extract_text_body(msg),
                 "attachments": _extract_attachments(msg, skip_attachments=self._skip_attachments),
+                "participants": _collect_participants(msg, sender_addr, (self._address, self._from_address)),
                 "date": msg.get("Date", ""), "sender_authenticated": sender_authenticated, "auth_reason": auth_reason}
 
     @staticmethod
@@ -677,7 +691,8 @@ class EmailAdapter(BasePlatformAdapter):
         # DOCUMENT wins over PHOTO for mixed attachments: run.py keys image handling off the per-path mime type regardless
         # of message_type, but document-context injection gates strictly on MessageType.DOCUMENT — so DOCUMENT surfaces both.
         kinds = {att["type"] for att in attachments}
-        self._thread_context[sender_addr] = {"subject": subject, "message_id": msg_data["message_id"]}
+        self._thread_context[sender_addr] = {"subject": subject, "message_id": msg_data["message_id"],
+                                             "participants": msg_data.get("participants") or []}
         name = msg_data["sender_name"] or sender_addr
         event = MessageEvent(
             text=text or "(empty email)", message_id=msg_data["message_id"],
@@ -718,6 +733,9 @@ class EmailAdapter(BasePlatformAdapter):
         for key, value in (("From", self._from_address), ("To", to_addr), ("Subject", subject), *threading,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
+        # smtplib's send_message() derives envelope recipients from To/Cc, so the header alone adds them.
+        if self._reply_all and (participants := ctx.get("participants")):
+            msg["Cc"] = ", ".join(participants)
         if body or attach_empty_body:
             msg.attach(MIMEText(body, "plain", "utf-8"))
         return msg, msg_id, subject
