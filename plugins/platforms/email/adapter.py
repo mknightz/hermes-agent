@@ -11,6 +11,7 @@ import re
 import smtplib
 import socket
 import ssl
+import time
 import uuid
 from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
@@ -369,6 +370,18 @@ class EmailAdapter(BasePlatformAdapter):
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
         # Opt-in reply-all: Cc the inbound thread's other participants (shared household / small-team mailboxes).
         self._reply_all = _esecret_bool("EMAIL_REPLY_ALL", is_truthy_value(extra.get("reply_all"), default=False))
+        # Repeat suppression: an identical (sender, subject) arriving within this window is dropped before it costs a
+        # model turn; the first occurrence dispatches, repeats are log-only. Mirrors the system-monitor alert throttle
+        # (the window is the recovery proxy — the mailbox can't see the condition clear). "Re:" subjects are never
+        # suppressed: human threads must always get through. EMAIL_REPEAT_SUPPRESS_HOURS (default 6; 0 disables).
+        repeat_hours = str(_get_secret("EMAIL_REPEAT_SUPPRESS_HOURS", "")).strip() or "6"
+        try:
+            self._repeat_window = max(0.0, float(repeat_hours)) * 3600.0
+        except ValueError:
+            logger.warning("[Email] Invalid EMAIL_REPEAT_SUPPRESS_HOURS=%r; using default 6h", repeat_hours)
+            self._repeat_window = 6 * 3600.0
+        self._repeat_max_keys = 1000
+        self._repeat_last_seen: Dict[Tuple[str, str], float] = {}
         self._skip_attachments = extra.get("skip_attachments", False)  # platforms.email.skip_attachments
         # Require an authenticated From: domain (SPF/DKIM/DMARC) before trusting it for authorization
         # (GHSA-rxqh-5572-8m77). Default ON; opt out via require_authenticated_sender: false / EMAIL_TRUST_FROM_HEADER=true.
@@ -398,6 +411,15 @@ class EmailAdapter(BasePlatformAdapter):
             logger.debug("[Email] Trimmed seen UIDs to %d entries", len(self._seen_uids))
         except (ValueError, TypeError):
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    def _trim_repeat_last_seen(self) -> None:
+        """Drop expired repeat-suppression stamps (the condition is presumed recovered); if still over the cap
+        (clock skew, pathological senders), keep the most recent half."""
+        now = time.time()
+        self._repeat_last_seen = {k: t for k, t in self._repeat_last_seen.items() if (now - t) < self._repeat_window}
+        if len(self._repeat_last_seen) > self._repeat_max_keys:
+            recent = sorted(self._repeat_last_seen.items(), key=lambda kv: kv[1], reverse=True)
+            self._repeat_last_seen = dict(recent[: self._repeat_max_keys // 2])
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """Create an IMAP connection using implicit TLS, STARTTLS, or plaintext."""
@@ -687,6 +709,16 @@ class EmailAdapter(BasePlatformAdapter):
         if not self._sender_accepted(sender_addr, msg_data):
             return
         subject, body, attachments = msg_data["subject"], msg_data["body"].strip(), msg_data["attachments"]
+        # Repeat suppression (see __init__): the stamp anchors at the last *dispatched* copy, so repeats don't extend it.
+        if self._repeat_window > 0 and subject and not subject.lower().startswith("re:"):
+            now, repeat_key = time.time(), (sender_addr.lower(), subject)
+            if (last_seen := self._repeat_last_seen.get(repeat_key)) is not None and (now - last_seen) < self._repeat_window:
+                logger.info("[Email] Suppressing repeat from %s — same subject within %.1fh: %s",
+                            sender_addr, self._repeat_window / 3600.0, subject)
+                return
+            self._repeat_last_seen[repeat_key] = now
+            if len(self._repeat_last_seen) > self._repeat_max_keys:
+                self._trim_repeat_last_seen()
         text = f"[Subject: {subject}]\n\n{body}" if subject and not subject.startswith("Re:") else body  # subject unless reply
         # DOCUMENT wins over PHOTO for mixed attachments: run.py keys image handling off the per-path mime type regardless
         # of message_type, but document-context injection gates strictly on MessageType.DOCUMENT — so DOCUMENT surfaces both.
