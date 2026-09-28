@@ -342,6 +342,8 @@ class EmailAdapter(BasePlatformAdapter):
         setting = lambda env, key: _get_secret(env, "") or extra.get(key, "")  # noqa: E731
         tls_verify = lambda env, key: _esecret_bool(env, is_truthy_value(extra.get(key), default=True))  # noqa: E731
         self._address = setting("EMAIL_ADDRESS", "address").strip()
+        # Optional From: header for outbound mail (e.g. an iCloud+ custom-domain alias); login stays EMAIL_ADDRESS.
+        self._from_address = setting("EMAIL_FROM_ADDRESS", "from_address").strip() or self._address
         self._password = _get_secret("EMAIL_PASSWORD", "")
         self._imap_host = setting("EMAIL_IMAP_HOST", "imap_host").strip()
         self._imap_port = _esecret_int("EMAIL_IMAP_PORT", 993)
@@ -532,7 +534,7 @@ class EmailAdapter(BasePlatformAdapter):
                 for uid in (data[0].split() if status == "OK" and data and data[0] else []):
                     if uid in self._seen_uids:
                         continue
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    status, msg_data = imap.uid("fetch", uid, "(BODY[])")
                     if status != "OK":
                         continue  # transient per-UID refusal: leave unseen so the next poll retries
                     # Mark seen once a response arrived (even malformed) so garbage is skipped once, not retried forever —
@@ -541,13 +543,12 @@ class EmailAdapter(BasePlatformAdapter):
                     # list of tuples). See #80032.
                     self._seen_uids.add(uid)
                     self._trim_seen_uids()
-                    try:
-                        raw_email = msg_data[0][1]
-                    except (IndexError, TypeError):
-                        logger.warning("[Email] Unexpected IMAP response structure for UID %s, skipping", uid)
-                        continue
-                    if not isinstance(raw_email, (bytes, bytearray)):
-                        logger.warning("[Email] Non-bytes IMAP payload for UID %s, skipping", uid)
+                    # The (header, body) tuple is not always first: iCloud interleaves bare bytes fragments,
+                    # so take the first tuple carrying a bytes payload wherever it sits.
+                    raw_email = next((item[1] for item in (msg_data or ()) if isinstance(item, tuple) and len(item) >= 2
+                                      and isinstance(item[1], (bytes, bytearray))), None)
+                    if raw_email is None:
+                        logger.warning("[Email] No body in fetch response for UID %s, skipping", uid)
                         continue
                     # One poison message (unparseable headers, pathological attachment, DNS hiccup) must not abort the batch or force a reconnect.
                     try:
@@ -704,7 +705,7 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = reply_to_msg_id or ctx.get("message_id")
         threading = (("In-Reply-To", original_msg_id), ("References", original_msg_id)) if original_msg_id else ()
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
-        for key, value in (("From", self._address), ("To", to_addr), ("Subject", subject), *threading,
+        for key, value in (("From", self._from_address), ("To", to_addr), ("Subject", subject), *threading,
                            ("Date", formatdate(localtime=True)), ("Message-ID", msg_id)):
             msg[key] = value
         if body or attach_empty_body:
@@ -806,11 +807,12 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
     smtp_host, smtp_port = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", ""), _esecret_int("EMAIL_SMTP_PORT", 587)
     smtp_security = _normalize_security(_get_secret("EMAIL_SMTP_SECURITY", "") or extra.get("smtp_security"), default="tls" if smtp_port == 465 else "starttls")
     smtp_tls_verify = _esecret_bool("EMAIL_SMTP_TLS_VERIFY", is_truthy_value(extra.get("smtp_tls_verify"), default=True))
+    from_address = (_get_secret("EMAIL_FROM_ADDRESS", "") or extra.get("from_address") or "").strip() or address
     if not all([address, password, smtp_host]):
         return send_error("Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)")
     try:
         msg = MIMEText(message, "plain", "utf-8")
-        for key, value in (("From", address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
+        for key, value in (("From", from_address), ("To", chat_id), ("Subject", "Hermes Agent"), ("Date", formatdate(localtime=True))):
             msg[key] = value
         server = _open_smtp(smtp_host, smtp_port, smtp_security, _tls_context(smtp_tls_verify, smtp_host), smtplib.SMTP, smtplib.SMTP_SSL)
         server.login(address, password)

@@ -1211,5 +1211,159 @@ class TestSenderAuthentication(unittest.TestCase):
         self.assertFalse(ok, reason)
 
 
+class TestImapBodyFetch(unittest.TestCase):
+    """IMAP fetch uses ``(BODY[])`` and finds the body tuple wherever it sits in
+    msg_data (iCloud interleaves bare bytes fragments and doesn't put it first)."""
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    @staticmethod
+    def _raw():
+        raw_email = MIMEText("Hello from iCloud", "plain", "utf-8")
+        raw_email["From"] = "user@icloud.com"
+        raw_email["Subject"] = "iCloud test"
+        raw_email["Message-ID"] = "<icloud@test.com>"
+        return raw_email.as_bytes()
+
+    def _fetch_with(self, msg_data):
+        adapter = self._make_adapter()
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
+        fetches = []
+
+        def uid_handler(command, *args):
+            if command == "search":
+                return ("OK", [b"1"])
+            if command == "fetch":
+                fetches.append(args)
+                return ("OK", msg_data)
+            return ("NO", [])
+
+        mock_imap.uid.side_effect = uid_handler
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            results = adapter._fetch_new_messages()
+        return adapter, results, fetches
+
+    def test_fetch_requests_body_not_rfc822(self):
+        _, _, fetches = self._fetch_with([(b"1 (BODY[] {10}", self._raw()), b")"])
+        self.assertEqual(fetches, [(b"1", "(BODY[])")])
+
+    def test_bytes_fragment_before_tuple(self):
+        """iCloud: a bare bytes status fragment precedes the (header, body) tuple."""
+        adapter, results, _ = self._fetch_with(
+            [b"1 (UID 1 FLAGS (\\Seen))", (b"1 (BODY[] {10}", self._raw()), b")"])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["sender_addr"], "user@icloud.com")
+        self.assertEqual(results[0]["body"], "Hello from iCloud")
+        self.assertIn(b"1", adapter._seen_uids)
+
+    def test_body_tuple_not_first(self):
+        """A leading tuple without a bytes payload is skipped; the body tuple is found later."""
+        _, results, _ = self._fetch_with(
+            [(b"1 (FLAGS (\\Seen))", None), b")", (b"1 (BODY[] {10}", self._raw())])
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["subject"], "iCloud test")
+
+    def test_no_body_tuple_warns_and_skips(self):
+        """No (bytes, bytes) tuple anywhere: warn, mark seen, skip (not retried forever)."""
+        with self.assertLogs("plugins.platforms.email.adapter", level="WARNING") as logs:
+            adapter, results, _ = self._fetch_with([b"1 (UID 1 FLAGS (\\Seen))", b")"])
+        self.assertEqual(results, [])
+        self.assertIn(b"1", adapter._seen_uids)
+        self.assertTrue(any("No body in fetch response" in line for line in logs.output))
+        self.assertFalse(adapter._last_fetch_failed)
+
+
+class TestFromAddressAlias(unittest.TestCase):
+    """EMAIL_FROM_ADDRESS sets the From: header on outbound mail; the SMTP
+    login identity stays EMAIL_ADDRESS."""
+
+    def _make_adapter(self, extra_env=None):
+        from gateway.config import PlatformConfig
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }
+        env.update(extra_env or {})
+        with patch.dict(os.environ, env):
+            if "EMAIL_FROM_ADDRESS" not in env:
+                os.environ.pop("EMAIL_FROM_ADDRESS", None)
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def _reply(self, adapter):
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email("user@test.com", "Here is the answer.", None)
+        return mock_server.send_message.call_args[0][0], mock_server
+
+    def test_default_from_is_login_address(self):
+        sent, _ = self._reply(self._make_adapter())
+        self.assertEqual(sent["From"], "hermes@test.com")
+
+    def test_blank_from_address_falls_back(self):
+        sent, _ = self._reply(self._make_adapter({"EMAIL_FROM_ADDRESS": "  "}))
+        self.assertEqual(sent["From"], "hermes@test.com")
+
+    def test_alias_used_as_from_login_unchanged(self):
+        adapter = self._make_adapter({"EMAIL_FROM_ADDRESS": "agent@alias.test"})
+        sent, mock_server = self._reply(adapter)
+        self.assertEqual(sent["From"], "agent@alias.test")
+        mock_server.login.assert_called_once_with("hermes@test.com", "secret")
+        # Message-ID stays on the login address's domain.
+        self.assertTrue(sent["Message-ID"].endswith("@test.com>"))
+
+    def test_alias_used_for_attachment_sends(self):
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter({"EMAIL_FROM_ADDRESS": "agent@alias.test"})
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+            f.write(b"doc")
+            tmp_path = f.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+                result = asyncio.run(adapter.send_document("user@test.com", tmp_path))
+            self.assertTrue(result.success)
+            self.assertEqual(mock_server.send_message.call_args[0][0]["From"], "agent@alias.test")
+        finally:
+            os.unlink(tmp_path)
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+        "EMAIL_SMTP_PORT": "587",
+        "EMAIL_FROM_ADDRESS": "agent@alias.test",
+    })
+    def test_standalone_send_uses_alias(self):
+        """Cron / home-channel delivery shows the same persona as replies."""
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            result = asyncio.run(_standalone_send(SimpleNamespace(extra={}), "user@test.com", "Hello"))
+        self.assertTrue(result["success"])
+        self.assertEqual(mock_server.send_message.call_args[0][0]["From"], "agent@alias.test")
+        mock_server.login.assert_called_once_with("hermes@test.com", "secret")
+
+
 if __name__ == "__main__":
     unittest.main()

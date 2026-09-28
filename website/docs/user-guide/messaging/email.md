@@ -226,3 +226,4 @@ Unless open access is on, Hermes acts on a message only when the `Authentication
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
+| `EMAIL_FROM_ADDRESS` | No | `EMAIL_ADDRESS` | `From:` header on outbound mail (e.g. a domain alias); login still uses `EMAIL_ADDRESS` |
